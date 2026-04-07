@@ -1,13 +1,13 @@
-use atty::Stream as AttyStream;
 use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use rupico::micropython;
+use rupico::micropython::join_remote_path;
 use serde::{Deserialize, Serialize};
 use serialport::available_ports;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -369,12 +369,11 @@ fn try_main() -> Result<(), Box<dyn Error>> {
                     cli.json,
                     last,
                 )?;
-                if !*dry_run {
-                    if let Some(t) = now {
+                if !*dry_run
+                    && let Some(t) = now {
                         state.last_sync_from_device = Some(t);
                         let _ = save_workspace_state(&workspace_root, &state);
                     }
-                }
             } else {
                 let last = state.last_sync_to_device;
                 cmd_sync_to_device(
@@ -388,12 +387,11 @@ fn try_main() -> Result<(), Box<dyn Error>> {
                     cli.json,
                     last,
                 )?;
-                if !*dry_run {
-                    if let Some(t) = now {
+                if !*dry_run
+                    && let Some(t) = now {
                         state.last_sync_to_device = Some(t);
                         let _ = save_workspace_state(&workspace_root, &state);
                     }
-                }
             }
         }
         Command::Repl => {
@@ -635,7 +633,7 @@ fn cmd_mkdir(port: &str, path: &str) -> Result<(), Box<dyn Error>> {
 fn cmd_run(port: &str, path: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
     with_raw_device(port, |dev| {
         let res = dev.run_file(path)?;
-        let use_color = atty::is(AttyStream::Stdout) && !quiet;
+        let use_color = io::stdout().is_terminal() && !quiet;
         if quiet {
             // In quiet mode, print raw stdout+stderr without extra labels.
             print!("{}{}", res.stdout, res.stderr);
@@ -660,8 +658,12 @@ fn cmd_run_local(port: &str, local: &str, quiet: bool) -> Result<(), Box<dyn Err
     const REMOTE_TEMP: &str = "/__rupico_temp__.py";
     with_raw_device(port, |dev| {
         dev.write_text_file(REMOTE_TEMP, &source)?;
-        let res = dev.run_file(REMOTE_TEMP)?;
-        let use_color = atty::is(AttyStream::Stdout) && !quiet;
+        let res = dev.run_file(REMOTE_TEMP);
+        // Best-effort cleanup: remove the temp file regardless of whether
+        // execution succeeded so we don't leave stale files on flash storage.
+        let _ = dev.remove(REMOTE_TEMP);
+        let res = res?;
+        let use_color = io::stdout().is_terminal() && !quiet;
         if quiet {
             print!("{}{}", res.stdout, res.stderr);
         } else if use_color {
@@ -683,7 +685,7 @@ fn cmd_run_local(port: &str, local: &str, quiet: bool) -> Result<(), Box<dyn Err
 fn cmd_run_snippet(port: &str, code: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
     with_raw_device(port, |dev| {
         let res = dev.run_snippet(code)?;
-        let use_color = atty::is(AttyStream::Stdout) && !quiet;
+        let use_color = io::stdout().is_terminal() && !quiet;
         if quiet {
             print!("{}{}", res.stdout, res.stderr);
         } else if use_color {
@@ -808,6 +810,8 @@ fn cmd_repl(port_path: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
         if n == 0 {
             break;
         }
+        // MicroPython's REPL expects \r to execute a line.
+        let line = line.replace('\n', "\r");
         port.write_all(line.as_bytes())?;
         port.flush()?;
     }
@@ -953,10 +957,10 @@ fn cmd_sync_to_device(
 
                 // Detect "both changed" conflicts based on last sync time, if
                 // we have one and both sides report modification times.
-                if let Some(t0) = last_sync_time {
-                    if let Some(info) = remote_info {
-                        if let (Some(lm), Some(rm)) = (local_info.modified, info.modified) {
-                            if lm > t0 && rm > t0 && lm != rm {
+                if let Some(t0) = last_sync_time
+                    && let Some(info) = remote_info
+                        && let (Some(lm), Some(rm)) = (local_info.modified, info.modified)
+                            && lm > t0 && rm > t0 && lm != rm {
                                 if !json {
                                     eprintln!(
                                         "sync-to-device: WARNING: both local and remote changed since last sync for {}",
@@ -970,9 +974,6 @@ fn cmd_sync_to_device(
                                     dry_run,
                                 });
                             }
-                        }
-                    }
-                }
 
                 let should_upload = match remote_info {
                     None => true,
@@ -990,21 +991,38 @@ fn cmd_sync_to_device(
                 };
 
                 if should_upload {
-                    if verbose && !json {
-                        println!(
-                            "sync-to-device: uploading {} -> {}",
-                            local_path.display(),
-                            remote_path
-                        );
+                    if dry_run {
+                        if !json {
+                            println!(
+                                "DRY RUN: would upload {} -> {}",
+                                local_path.display(),
+                                remote_path
+                            );
+                        }
+                        actions.push(SyncAction {
+                            op: "upload".to_string(),
+                            local: Some(local_path.display().to_string()),
+                            remote: Some(remote_path.clone()),
+                            dry_run: true,
+                        });
+                    } else {
+                        if verbose && !json {
+                            println!(
+                                "sync-to-device: uploading {} -> {}",
+                                local_path.display(),
+                                remote_path
+                            );
+                        }
+                        let data =
+                            fs::read(&local_path).map_err(micropython::MicroPythonError::Io)?;
+                        dev.write_file(&remote_path, &data)?;
+                        actions.push(SyncAction {
+                            op: "upload".to_string(),
+                            local: Some(local_path.display().to_string()),
+                            remote: Some(remote_path.clone()),
+                            dry_run: false,
+                        });
                     }
-                    let data = fs::read(&local_path).map_err(micropython::MicroPythonError::Io)?;
-                    dev.write_file(&remote_path, &data)?;
-                    actions.push(SyncAction {
-                        op: "upload".to_string(),
-                        local: Some(local_path.display().to_string()),
-                        remote: Some(remote_path.clone()),
-                        dry_run: false,
-                    });
                 } else {
                     if verbose && !json {
                         println!("sync-to-device: skipping unchanged {}", remote_path);
@@ -1206,9 +1224,9 @@ fn cmd_sync_from_device(
 
                 // Detect "both changed" conflicts based on last sync time, if
                 // we have one and both sides report modification times.
-                if let (Some(t0), Some(local_info)) = (last_sync_time, maybe_local_info) {
-                    if let (Some(lm), Some(rm)) = (local_info.modified, info.modified) {
-                        if lm > t0 && rm > t0 && lm != rm {
+                if let (Some(t0), Some(local_info)) = (last_sync_time, maybe_local_info)
+                    && let (Some(lm), Some(rm)) = (local_info.modified, info.modified)
+                        && lm > t0 && rm > t0 && lm != rm {
                             if !json {
                                 eprintln!(
                                     "sync-from-device: WARNING: both local and remote changed since last sync for {}",
@@ -1222,8 +1240,6 @@ fn cmd_sync_from_device(
                                 dry_run,
                             });
                         }
-                    }
-                }
 
                 let needs_download = match maybe_local_info {
                     None => true,
@@ -1291,16 +1307,6 @@ fn cmd_sync_from_device(
     }
 
     Ok(())
-}
-
-fn join_remote_path(base: &str, name: &str) -> String {
-    if base == "/" {
-        format!("/{}", name)
-    } else if base.ends_with('/') {
-        format!("{}{}", base, name)
-    } else {
-        format!("{}/{}", base, name)
-    }
 }
 
 fn rel_path_to_remote(rel: &Path) -> String {

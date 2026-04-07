@@ -1,5 +1,5 @@
 use eframe::egui;
-use rupico::micropython::{ExecResult, MicroPythonDevice, Result as MpResult};
+use rupico::micropython::{join_remote_path, ExecResult, MicroPythonDevice, Result as MpResult};
 use serialport::available_ports;
 
 /// Simple in-memory representation of a remote file or directory for the GUI
@@ -473,8 +473,8 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.heading("Rupico GUI");
 
             ui.horizontal(|ui| {
@@ -485,7 +485,7 @@ impl eframe::App for GuiApp {
                     .as_ref()
                     .and_then(|p| self.available_ports.iter().position(|s| s == p));
 
-                egui::ComboBox::from_id_source("port_combo")
+                egui::ComboBox::from_id_salt("port_combo")
                     .width(200.0)
                     .selected_text(
                         selected_index
@@ -526,10 +526,34 @@ impl eframe::App for GuiApp {
             }
         });
 
-        egui::SidePanel::left("file_panel")
+        // Status bar at the bottom (must come before CentralPanel)
+        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                let port_label = self
+                    .selected_port
+                    .as_deref()
+                    .unwrap_or("(no port selected)");
+                let status_label = if self.device.is_some() {
+                    "Connected"
+                } else {
+                    "Disconnected"
+                };
+                ui.label(format!("Port: {port_label}"));
+                ui.separator();
+                ui.label(status_label);
+                ui.separator();
+                if let Some(msg) = &self.last_status {
+                    ui.label(msg);
+                } else {
+                    ui.label("Ready");
+                }
+            });
+        });
+
+        egui::Panel::left("file_panel")
             .resizable(true)
-            .default_width(260.0)
-            .show(ctx, |ui| {
+            .default_size(260.0)
+            .show_inside(ui, |ui| {
                 ui.heading("Device files");
 
                 if ui.button("Refresh tree").clicked() {
@@ -558,20 +582,16 @@ impl eframe::App for GuiApp {
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Rename"))
                         .clicked()
-                    {
-                        if let Some(path) = self.selected_remote_path.clone() {
+                        && let Some(path) = self.selected_remote_path.clone() {
                             self.rename_from = Some((path.clone(), self.selected_remote_is_dir));
                             self.rename_to = path;
                         }
-                    }
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Delete"))
                         .clicked()
-                    {
-                        if let Some(path) = self.selected_remote_path.clone() {
+                        && let Some(path) = self.selected_remote_path.clone() {
                             self.confirm_delete = Some((path, self.selected_remote_is_dir));
                         }
-                    }
                 });
 
                 ui.separator();
@@ -587,7 +607,59 @@ impl eframe::App for GuiApp {
                 self.selected_remote_is_dir = selected_is_dir;
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        if let Some((path, is_dir)) = self.confirm_delete.clone() {
+            egui::Window::new("Confirm delete")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    if is_dir {
+                        ui.label(format!("Delete directory '{path}' from device?"));
+                    } else {
+                        ui.label(format!("Delete file '{path}' from device?"));
+                    }
+                    ui.label("This cannot be undone.");
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = None;
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.delete_path_internal(&path, is_dir);
+                            self.confirm_delete = None;
+                        }
+                    });
+                });
+        }
+
+        if let Some((from, is_dir)) = self.rename_from.clone() {
+            egui::Window::new("Rename")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    if is_dir {
+                        ui.label(format!("Rename directory '{from}'"));
+                    } else {
+                        ui.label(format!("Rename file '{from}'"));
+                    }
+                    ui.label("New path:");
+                    ui.text_edit_singleline(&mut self.rename_to);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.rename_from = None;
+                        }
+                        if ui.button("Rename").clicked() {
+                            let new_path = self.rename_to.trim().to_string();
+                            if !new_path.is_empty() && new_path != from {
+                                self.rename_path_internal(&from, &new_path, is_dir);
+                            }
+                            self.rename_from = None;
+                        }
+                    });
+                });
+        }
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             // Tab bar
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
@@ -630,11 +702,10 @@ impl eframe::App for GuiApp {
                 if ui.button("Clear output").clicked() {
                     self.last_output = None;
                 }
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    if let Some(path) = &tab.path {
+                if let Some(tab) = self.tabs.get(self.active_tab)
+                    && let Some(path) = &tab.path {
                         ui.label(format!("Editing: {path}"));
                     }
-                }
             });
 
             ui.separator();
@@ -674,92 +745,6 @@ impl eframe::App for GuiApp {
                 }
             });
         });
-
-        if let Some((path, is_dir)) = self.confirm_delete.clone() {
-            egui::Window::new("Confirm delete")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if is_dir {
-                        ui.label(format!("Delete directory '{path}' from device?"));
-                    } else {
-                        ui.label(format!("Delete file '{path}' from device?"));
-                    }
-                    ui.label("This cannot be undone.");
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_delete = None;
-                        }
-                        if ui.button("Delete").clicked() {
-                            self.delete_path_internal(&path, is_dir);
-                            self.confirm_delete = None;
-                        }
-                    });
-                });
-        }
-
-        if let Some((from, is_dir)) = self.rename_from.clone() {
-            egui::Window::new("Rename")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if is_dir {
-                        ui.label(format!("Rename directory '{from}'"));
-                    } else {
-                        ui.label(format!("Rename file '{from}'"));
-                    }
-                    ui.label("New path:");
-                    ui.text_edit_singleline(&mut self.rename_to);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.rename_from = None;
-                        }
-                        if ui.button("Rename").clicked() {
-                            let new_path = self.rename_to.trim().to_string();
-                            if !new_path.is_empty() && new_path != from {
-                                self.rename_path_internal(&from, &new_path, is_dir);
-                            }
-                            self.rename_from = None;
-                        }
-                    });
-                });
-        }
-
-        // Status bar at the bottom
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let port_label = self
-                    .selected_port
-                    .as_deref()
-                    .unwrap_or("(no port selected)");
-                let status_label = if self.device.is_some() {
-                    "Connected"
-                } else {
-                    "Disconnected"
-                };
-                ui.label(format!("Port: {port_label}"));
-                ui.separator();
-                ui.label(status_label);
-                ui.separator();
-                if let Some(msg) = &self.last_status {
-                    ui.label(msg);
-                } else {
-                    ui.label("Ready");
-                }
-            });
-        });
-    }
-}
-
-fn join_remote_path(base: &str, name: &str) -> String {
-    if base == "/" {
-        format!("/{}", name)
-    } else if base.ends_with('/') {
-        format!("{}{}", base, name)
-    } else {
-        format!("{}/{}", base, name)
     }
 }
 
@@ -798,7 +783,7 @@ fn show_remote_node(
 ) {
     if node.is_dir {
         let resp = egui::CollapsingHeader::new(&node.name)
-            .id_source(&node.path)
+            .id_salt(&node.path)
             .show(ui, |ui| {
                 for child in &node.children {
                     show_remote_node(ui, child, selected_path, selected_is_dir);
@@ -833,6 +818,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Rupico GUI",
         options,
-        Box::new(|_cc| Box::new(GuiApp::default()) as Box<dyn eframe::App>),
+        Box::new(|_cc| Ok(Box::new(GuiApp::default()) as Box<dyn eframe::App>)),
     )
 }

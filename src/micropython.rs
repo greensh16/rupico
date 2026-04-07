@@ -750,6 +750,20 @@ impl MicroPythonDevice {
     }
 }
 
+/// Join a base remote path and a name component into a single remote path.
+///
+/// Handles the root `/` special case so that `join_remote_path("/", "main.py")`
+/// produces `"/main.py"` rather than `"//main.py"`.
+pub fn join_remote_path(base: &str, name: &str) -> String {
+    if base == "/" {
+        format!("/{}", name)
+    } else if base.ends_with('/') {
+        format!("{}{}", base, name)
+    } else {
+        format!("{}/{}", base, name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
