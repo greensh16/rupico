@@ -10,9 +10,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fails fast, before spending four platform builds on a mislabelled release.
+  verify:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare versions
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # A two-part tag such as v0.1 is accepted for Cargo's 0.1.0.
+          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" \
+             && "${TAG_VERSION}.0" != "${CARGO_VERSION}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION}."
+            echo "Bump the version in Cargo.toml (and commit Cargo.lock), or retag."
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches Cargo.toml ${CARGO_VERSION}."
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Skipped on workflow_dispatch, where `verify` does not run.
+    needs: [verify]
+    if: always() && !contains(needs.*.result, 'failure')
     strategy:
       # One platform failing should not hide whether the others built.
       fail-fast: false
