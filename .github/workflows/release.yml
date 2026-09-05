@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets you rehearse the build without cutting a release.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide whether the others built.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14 # Apple silicon
+            target: aarch64-apple-darwin
+          - os: macos-13 # Intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # serialport links libudev; eframe wants X11/Wayland/xkb.
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libudev-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libwayland-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # `--locked` so a release is built from the committed Cargo.lock and not
+      # from whatever resolved that day.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="rupico-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${{ matrix.target }}/release/rupico" "dist/${STAGE}/"
+          cp "target/${{ matrix.target }}/release/rupico_gui" "dist/${STAGE}/"
+          cp README.md LICENSE "dist/${STAGE}/"
+          strip "dist/${STAGE}/rupico" "dist/${STAGE}/rupico_gui" || true
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          echo "ASSET=dist/${STAGE}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          $stage = "rupico-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rupico.exe" "dist/$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/rupico_gui.exe" "dist/$stage/"
+          Copy-Item README.md, LICENSE "dist/$stage/"
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          "ASSET=dist/$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a real tag produces a release; workflow_dispatch just rehearses the
+    # build above.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Globbed explicitly rather than `*.tar.gz *.zip`: an unmatched glob
+          # would be passed through literally and abort the step.
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec sha256sum {} + | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+
+      # `gh` is preinstalled on the runner, so this needs no third-party action.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A tag like v0.2.0-rc1 is published as a pre-release.
+          PRERELEASE=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            PRERELEASE="--prerelease"
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ${PRERELEASE} \
+            dist/*

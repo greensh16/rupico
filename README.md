@@ -1,5 +1,7 @@
 # rupico
 
+[![CI](https://github.com/greensh16/rupico/actions/workflows/ci.yml/badge.svg)](https://github.com/greensh16/rupico/actions/workflows/ci.yml)
+
 A Rust library, CLI and desktop app for working with MicroPython boards — the
 Raspberry Pi Pico and anything else that speaks the raw REPL over serial.
 
@@ -37,6 +39,12 @@ rupico -p /dev/cu.usbmodem101 run /main.py     # run it
   ports found".
 
 ## Install
+
+Prebuilt binaries for macOS (Intel and Apple silicon), Linux and Windows are
+attached to each [release](https://github.com/greensh16/rupico/releases).
+Download, unpack, and put `rupico` on your `PATH`.
+
+To build from source instead:
 
 ```bash
 git clone https://github.com/greensh16/rupico
