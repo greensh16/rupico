@@ -121,6 +121,18 @@ fn main() -> Result<()> {
 
 → [Library API](https://github.com/greensh16/rupico/wiki/Library-API)
 
+## Staying up to date
+
+```bash
+rupico update --check    # is there a newer release?
+rupico update            # download, verify and replace this executable
+```
+
+Downloads are verified against the release's published `SHA256SUMS` before
+anything is replaced, and the update refuses to proceed if that check cannot be
+made. The desktop app has the same feature behind the version button on its
+toolbar. Nothing is checked automatically — there is no background phone-home.
+
 ## Exit codes
 
 | Code | Meaning |

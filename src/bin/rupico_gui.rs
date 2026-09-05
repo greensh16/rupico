@@ -14,6 +14,7 @@ use rupico::micropython::{
     vid_looks_micropython,
 };
 use rupico::sync;
+use rupico::update;
 use serialport::available_ports;
 use std::path::PathBuf;
 
@@ -450,6 +451,27 @@ impl Prefs {
     }
 }
 
+/// Result of a background update job.
+enum UpdateMsg {
+    Checked(Result<Option<update::Check>, String>),
+    Installed(Result<String, String>),
+}
+
+/// State of the update dialog.
+///
+/// Unlike device I/O, the update check runs on a worker thread: a network call
+/// on the UI thread would freeze the window for up to the HTTP timeout.
+#[derive(Default)]
+struct UpdatePanel {
+    open: bool,
+    busy: bool,
+    rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
+    /// Message and whether it is an error, for colouring.
+    status: Option<(String, bool)>,
+    /// Set once a check has found something newer.
+    available: Option<update::Release>,
+}
+
 struct GuiApp {
     // Connection
     available_ports: Vec<PortEntry>,
@@ -479,6 +501,7 @@ struct GuiApp {
     creating: Option<(String, String)>,
     confirm_delete: Option<(String, bool)>,
     sync_panel: SyncPanel,
+    update_panel: UpdatePanel,
 }
 
 impl Default for GuiApp {
@@ -513,6 +536,7 @@ impl Default for GuiApp {
             creating: None,
             confirm_delete: None,
             sync_panel,
+            update_panel: UpdatePanel::default(),
         }
     }
 }
@@ -1077,6 +1101,18 @@ impl GuiApp {
             {
                 self.sync_panel.open = true;
             }
+
+            // Version doubles as the way in to the update dialog, so it is
+            // always visible without taking a toolbar slot of its own.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(format!("v{}", update::current_version()))
+                    .on_hover_text("Check for updates")
+                    .clicked()
+                {
+                    self.update_panel.open = true;
+                }
+            });
         });
     }
 
@@ -1680,6 +1716,175 @@ impl GuiApp {
     }
 }
 
+impl GuiApp {
+    /// Start a background update check.
+    ///
+    /// The worker owns the network call; the UI thread only polls for the
+    /// result, so the window keeps redrawing while it runs.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if self.update_panel.busy {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::check(update::REPO).map_err(|e| e.to_string());
+            let _ = tx.send(UpdateMsg::Checked(result));
+            // Wake the UI so it notices without waiting for the next event.
+            ctx.request_repaint();
+        });
+        self.update_panel.busy = true;
+        self.update_panel.status = Some(("Checking for updates…".to_string(), false));
+        self.update_panel.available = None;
+        self.update_panel.rx = Some(rx);
+    }
+
+    /// Download, verify and install the release found by a previous check.
+    fn start_update_install(&mut self, ctx: &egui::Context) {
+        let Some(release) = self.update_panel.available.clone() else {
+            return;
+        };
+        if self.update_panel.busy {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let version = release.version.clone();
+            let result = update::install(&release)
+                .map(|()| version)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(UpdateMsg::Installed(result));
+            ctx.request_repaint();
+        });
+        self.update_panel.busy = true;
+        self.update_panel.status = Some(("Downloading and verifying…".to_string(), false));
+        self.update_panel.rx = Some(rx);
+    }
+
+    /// Collect any finished update job. Called once per frame.
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_panel.rx else {
+            return;
+        };
+        let Ok(msg) = rx.try_recv() else {
+            return;
+        };
+        self.update_panel.rx = None;
+        self.update_panel.busy = false;
+
+        match msg {
+            UpdateMsg::Checked(Ok(None)) => {
+                self.update_panel.status =
+                    Some(("No releases have been published yet.".to_string(), false));
+            }
+            UpdateMsg::Checked(Ok(Some(update::Check::UpToDate { current }))) => {
+                self.update_panel.status =
+                    Some((format!("rupico {current} is the latest release."), false));
+            }
+            UpdateMsg::Checked(Ok(Some(update::Check::Available { current, release }))) => {
+                self.update_panel.status = Some((
+                    format!(
+                        "Version {} is available (you have {current}).",
+                        release.version
+                    ),
+                    false,
+                ));
+                self.update_panel.available = Some(release);
+            }
+            UpdateMsg::Checked(Err(e)) => {
+                self.update_panel.status = Some((e, true));
+            }
+            UpdateMsg::Installed(Ok(version)) => {
+                self.update_panel.available = None;
+                self.update_panel.status = Some((
+                    format!("Updated to {version}. Restart rupico to use it."),
+                    false,
+                ));
+            }
+            UpdateMsg::Installed(Err(e)) => {
+                self.update_panel.status = Some((e, true));
+            }
+        }
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let mut open = self.update_panel.open;
+        egui::Window::new("Updates")
+            .open(&mut open)
+            .resizable(false)
+            .default_size([420.0, 200.0])
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Installed").small().color(pal.dim));
+                    ui.label(
+                        egui::RichText::new(update::current_version())
+                            .font(code_font())
+                            .color(pal.ident),
+                    );
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.update_panel.busy,
+                            egui::Button::new("Check for updates"),
+                        )
+                        .clicked()
+                    {
+                        self.start_update_check(ctx);
+                    }
+                    if self.update_panel.available.is_some()
+                        && ui
+                            .add_enabled(
+                                !self.update_panel.busy,
+                                egui::Button::new("Download and install").fill(pal.accent),
+                            )
+                            .clicked()
+                    {
+                        self.start_update_install(ctx);
+                    }
+                    if self.update_panel.busy {
+                        ui.spinner();
+                    }
+                });
+
+                if let Some((msg, is_error)) = &self.update_panel.status {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(msg).color(if *is_error {
+                        pal.err
+                    } else {
+                        pal.ident
+                    }));
+                }
+
+                if let Some(release) = &self.update_panel.available {
+                    ui.add_space(4.0);
+                    ui.hyperlink_to(
+                        egui::RichText::new("Release notes").small(),
+                        release.html_url.clone(),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The download is checked against the release's published SHA256SUMS \
+                         before anything is replaced. Only this application is updated — the \
+                         rupico command-line tool updates separately with `rupico update`.",
+                    )
+                    .small()
+                    .color(pal.dim),
+                );
+            });
+        self.update_panel.open = open;
+    }
+}
+
 /// A focused single-line field used for inline create/rename in the tree.
 fn inline_name_field(ui: &mut egui::Ui, buf: &mut String, hint: &str) {
     ui.horizontal(|ui| {
@@ -1904,8 +2109,14 @@ impl eframe::App for GuiApp {
             self.editor(ui, &pal);
         });
 
+        self.poll_update();
+
         if self.sync_panel.open {
             self.sync_window(&ctx, &pal);
+        }
+
+        if self.update_panel.open {
+            self.update_window(&ctx, &pal);
         }
 
         if let Some((path, is_dir)) = self.confirm_delete.clone() {

@@ -4,6 +4,7 @@ use rupico::micropython;
 use rupico::micropython::join_remote_path;
 use rupico::micropython::vid_looks_micropython;
 use rupico::sync;
+use rupico::update;
 use serialport::available_ports;
 use std::collections::HashMap;
 use std::error::Error;
@@ -229,6 +230,16 @@ enum Command {
 
     /// Simple interactive REPL proxy.
     Repl,
+
+    /// Update rupico to the latest published release.
+    ///
+    /// Downloads the release archive for this platform, verifies it against
+    /// the release's SHA256SUMS, and replaces this executable.
+    Update {
+        /// Only report whether a newer version exists; install nothing.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// Process exit code used when a sync finds files that changed on both sides.
@@ -463,6 +474,9 @@ fn try_main() -> Result<i32, Box<dyn Error>> {
         Command::Repl => {
             let opts = device_opts(&cli)?;
             cmd_repl(&opts, cli.quiet)?;
+        }
+        Command::Update { check } => {
+            exit_code = cmd_update(*check, cli.quiet)?;
         }
     }
 
@@ -736,6 +750,57 @@ fn cmd_mkdir(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
         dev.mkdir(path)?;
         Ok(())
     })
+}
+
+/// Check for, and optionally install, a newer release.
+///
+/// This is the only command that touches the network, and it does so only
+/// when explicitly invoked — there is no background check.
+fn cmd_update(check_only: bool, quiet: bool) -> Result<i32, Box<dyn Error>> {
+    let current = update::current_version();
+
+    let outcome = update::check(update::REPO)?;
+    let Some(outcome) = outcome else {
+        println!("No releases have been published yet (installed: {current}).");
+        return Ok(0);
+    };
+
+    let release = match outcome {
+        update::Check::UpToDate { current } => {
+            println!("rupico {current} is the latest release.");
+            return Ok(0);
+        }
+        update::Check::Available { current, release } => {
+            println!(
+                "A new release is available: {current} -> {}",
+                release.version
+            );
+            if !quiet {
+                println!("{}", release.html_url);
+            }
+            release
+        }
+    };
+
+    if check_only {
+        println!("Run `rupico update` to install it.");
+        return Ok(0);
+    }
+
+    let binary = update::running_binary_name()?;
+    if !quiet {
+        println!(
+            "Downloading and verifying {}...",
+            update::asset_name(&release.version, update::target_triple())
+        );
+    }
+    update::install(&release)?;
+
+    println!("Updated {binary} to {}.", release.version);
+    if !quiet && binary == "rupico" {
+        println!("The desktop app updates separately: run `rupico_gui` and use Check for updates.");
+    }
+    Ok(0)
 }
 
 /// Print one sync decision in human-readable form.

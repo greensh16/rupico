@@ -37,6 +37,9 @@ jobs:
     # Skipped on workflow_dispatch, where `verify` does not run.
     needs: [verify]
     if: always() && !contains(needs.*.result, 'failure')
+    # Without this, a job requesting a runner label that no longer exists sits
+    # queued indefinitely and the release never publishes.
+    timeout-minutes: 45
     strategy:
       # One platform failing should not hide whether the others built.
       fail-fast: false
@@ -44,9 +47,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-14 # Apple silicon
+          - os: macos-latest # Apple silicon, native
             target: aarch64-apple-darwin
-          - os: macos-13 # Intel
+          # Intel macOS is cross-compiled from the Apple-silicon runner: the
+          # macOS SDK carries both slices, and the `macos-13` Intel runner has
+          # been retired, so a job requesting it queues forever.
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -74,6 +80,23 @@ jobs:
       # from whatever resolved that day.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Cross-compiling is easy to get silently wrong, so check the binary is
+      # the architecture the asset name claims.
+      - name: Verify architecture (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ matrix.target }}"
+          EXPECTED="${EXPECTED%%-*}"   # x86_64 or aarch64
+          ACTUAL=$(lipo -archs "target/${{ matrix.target }}/release/rupico")
+          # lipo spells aarch64 as arm64.
+          [[ "${EXPECTED}" == "aarch64" ]] && EXPECTED="arm64"
+          if [[ "${ACTUAL}" != *"${EXPECTED}"* ]]; then
+            echo "::error::Built ${ACTUAL} but the asset claims ${EXPECTED}."
+            exit 1
+          fi
+          echo "rupico is ${ACTUAL}, as expected."
 
       - name: Package (unix)
         if: runner.os != 'Windows'
