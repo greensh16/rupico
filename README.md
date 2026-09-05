@@ -49,19 +49,24 @@ Prebuilt binaries for macOS (Intel and Apple silicon), Linux and Windows are
 attached to each [release](https://github.com/greensh16/rupico/releases).
 Download, unpack, and put `rupico` on your `PATH`.
 
-To build from source instead:
+Or install the CLI from crates.io:
+
+```bash
+cargo install rupico                    # CLI only
+cargo install rupico --features gui     # CLI plus the desktop app
+```
+
+The desktop app is behind the `gui` feature because it pulls in a graphics
+stack that more than doubles the dependency count; the downloadable release
+archives above already contain both binaries.
+
+To build from source:
 
 ```bash
 git clone https://github.com/greensh16/rupico
 cd rupico
-cargo install --path .
-```
-
-Or run without installing:
-
-```bash
-cargo run -- --help              # the CLI
-cargo run --bin rupico_gui       # the desktop app
+cargo run -- --help                       # the CLI
+cargo run --features gui --bin rupico_gui # the desktop app
 ```
 
 ## Quick start
@@ -163,7 +168,7 @@ toolbar. Nothing is checked automatically — there is no background phone-home.
 ## Development
 
 ```bash
-cargo test                          # no hardware required
+cargo test --all-features           # no hardware required
 cargo clippy --all-targets --all-features
 cargo fmt
 ```

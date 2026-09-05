@@ -23,3 +23,13 @@ target
 WARP.md
 .vscode/
 .DS_Store
+
+# Stray release binary built into the repo root (the real build output lives
+# in target/). An out-of-date copy here is dangerous: it looks runnable but
+# predates fixes.
+/rupico
+/rupico.wiki
+CLAUDE.md
+
+# Release staging built by .github/workflows/release.yml
+/dist

@@ -78,8 +78,10 @@ jobs:
 
       # `--locked` so a release is built from the committed Cargo.lock and not
       # from whatever resolved that day.
+      # `--features gui` because the desktop app is an opt-in feature for
+      # crates.io users, but downloaded release archives ship both binaries.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --features gui --target ${{ matrix.target }}
 
       # Cross-compiling is easy to get silently wrong, so check the binary is
       # the architecture the asset name claims.

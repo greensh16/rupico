@@ -98,8 +98,13 @@ jobs:
       - name: cargo test
         run: cargo test --all-features --locked
 
-      - name: cargo build
+      # The default shape is what `cargo install rupico` builds: CLI only.
+      - name: cargo build (default, CLI only)
         run: cargo build --all-targets --locked
+
+      # And the shape release archives are built with.
+      - name: cargo build (with gui)
+        run: cargo build --all-targets --locked --features gui
 
   msrv:
     name: Minimum supported Rust (1.95)

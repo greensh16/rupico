@@ -3,6 +3,20 @@ name = "rupico"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+description = "Library, CLI and desktop app for MicroPython boards: raw REPL, file transfer and project sync over serial"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/greensh16/rupico"
+homepage = "https://github.com/greensh16/rupico"
+documentation = "https://docs.rs/rupico"
+readme = "README.md"
+# Binaries are declared explicitly below so the GUI can require its feature;
+# auto-discovery would otherwise compile it with eframe absent.
+autobins = false
+keywords = ["micropython", "pico", "serial", "embedded", "repl"]
+categories = ["command-line-utilities", "embedded", "hardware-support", "development-tools"]
+# The wiki is a separate git repository that happens to live inside this
+# directory; it must never end up inside the published crate.
+exclude = ["rupico.wiki/", "dist/", ".github/"]
 
 [dependencies]
 serialport = "4"
@@ -11,18 +25,34 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.36.1"
+eframe = { version = "0.36.1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 toml = "0.8"
 sha2 = "0.10"
 ctrlc = "3"
-rfd = "0.17.2"
+rfd = { version = "0.17.2", optional = true }
 ureq = "3.4.0"
 semver = "1.0.28"
 self-replace = "1.5.0"
 flate2 = "1.1.10"
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[features]
+# The desktop app is opt-in: `cargo install rupico` gets the CLI only, and
+# `cargo install rupico --features gui` adds the GUI. Binary releases are built
+# with the feature on, so downloaded archives contain both.
+default = []
+gui = ["dep:eframe", "dep:rfd"]
+
+[[bin]]
+name = "rupico"
+path = "src/main.rs"
+
+[[bin]]
+name = "rupico_gui"
+path = "src/bin/rupico_gui.rs"
+required-features = ["gui"]
 
 [dev-dependencies]
 assert_cmd = "2"
