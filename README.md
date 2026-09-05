@@ -1,6 +1,11 @@
 # rupico
 
 [![CI](https://github.com/greensh16/rupico/actions/workflows/ci.yml/badge.svg)](https://github.com/greensh16/rupico/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/greensh16/rupico?label=release)](https://github.com/greensh16/rupico/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/greensh16/rupico/total)](https://github.com/greensh16/rupico/releases)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](https://github.com/greensh16/rupico/releases/latest)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-dea584)](https://www.rust-lang.org)
+[![License](https://img.shields.io/github/license/greensh16/rupico)](LICENSE)
 
 A Rust library, CLI and desktop app for working with MicroPython boards — the
 Raspberry Pi Pico and anything else that speaks the raw REPL over serial.
