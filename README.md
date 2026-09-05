@@ -33,7 +33,7 @@ rupico -p /dev/cu.usbmodem101 run /main.py     # run it
 
 ## Requirements
 
-- Rust **1.92 or newer** (enforced via `rust-version` in `Cargo.toml`).
+- Rust **1.95 or newer** (enforced via `rust-version` in `Cargo.toml`).
 - A board flashed with MicroPython.
 - A USB cable that carries data — charge-only cables are a common cause of "no
   ports found".

@@ -102,7 +102,7 @@ jobs:
         run: cargo build --all-targets --locked
 
   msrv:
-    name: Minimum supported Rust (1.92)
+    name: Minimum supported Rust (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,10 +116,11 @@ jobs:
             libxkbcommon-dev libwayland-dev
 
       # Checks the `rust-version` in Cargo.toml is honest. Bump both together.
-      - name: Install Rust 1.92
+      # Currently pinned by egui/eframe 0.36, which require 1.95.
+      - name: Install Rust 1.95
         run: |
-          rustup toolchain install 1.92 --profile minimal
-          rustup default 1.92
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
 
       - uses: actions/cache@v4
         with:
