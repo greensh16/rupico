@@ -2,17 +2,21 @@
 name = "rupico"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 
 [dependencies]
 serialport = "4"
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.34.1"
+eframe = "0.36.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 toml = "0.8"
+sha2 = "0.10"
+ctrlc = "3"
+rfd = "0.17.2"
 
 [dev-dependencies]
 assert_cmd = "2"

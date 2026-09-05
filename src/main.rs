@@ -2,9 +2,10 @@ use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use rupico::micropython;
 use rupico::micropython::join_remote_path;
-use serde::{Deserialize, Serialize};
+use rupico::micropython::vid_looks_micropython;
+use rupico::sync;
 use serialport::available_ports;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -32,8 +33,26 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Serial baud rate for device connections.
+    #[arg(long, global = true, default_value_t = 115_200)]
+    baud: u32,
+
+    /// Idle read timeout in seconds for device operations. The timer resets
+    /// whenever the device sends data, so long transfers are safe. Use 0 to
+    /// wait forever (useful for long-running programs with `run`).
+    #[arg(long = "timeout", global = true, default_value_t = 3)]
+    timeout_secs: u64,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Connection parameters shared by all device-facing commands.
+struct DeviceOpts {
+    port: String,
+    baud: u32,
+    /// Idle read timeout; `None` means wait forever.
+    read_timeout: Option<Duration>,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +62,15 @@ enum Command {
         /// Only show ports that appear to be running MicroPython.
         #[arg(long = "only-micropython")]
         only_micropython: bool,
+        /// Actively probe every serial port by opening it and running a
+        /// small identification snippet. This finds boards behind generic
+        /// USB-serial bridges (CP210x, CH340, FTDI) that the vendor ID
+        /// cannot identify, but it writes a few bytes to each port, so
+        /// only pass it when you know what else is plugged in. Without this
+        /// flag detection is passive (USB vendor ID only) and never writes
+        /// to any port.
+        #[arg(long)]
+        probe: bool,
     },
 
     /// List files in a directory on the device.
@@ -192,14 +220,36 @@ enum Command {
         /// top of built-in ignores like `.git` and `__pycache__`.
         #[arg(long = "ignore")]
         ignore: Vec<String>,
+        /// Overwrite files that changed on both sides since the last sync.
+        /// Without this, conflicting files are left untouched and the command
+        /// exits non-zero.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Simple interactive REPL proxy.
     Repl,
 }
 
+/// Process exit code used when a sync finds files that changed on both sides.
+const EXIT_CONFLICT: i32 = 2;
+
+/// Process exit code used when code run on the device raised an exception.
+const EXIT_DEVICE_ERROR: i32 = 3;
+
 fn main() {
-    if let Err(e) = try_main() {
+    match try_main() {
+        Ok(code) => {
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Err(e) => report_error_and_exit(e),
+    }
+}
+
+fn report_error_and_exit(e: Box<dyn Error>) -> ! {
+    {
         if let Some(mp) = e.downcast_ref::<micropython::MicroPythonError>() {
             use rupico::micropython::MicroPythonError;
             match mp {
@@ -228,68 +278,72 @@ fn main() {
     }
 }
 
-fn try_main() -> Result<(), Box<dyn Error>> {
+fn try_main() -> Result<i32, Box<dyn Error>> {
     let cli = Cli::parse();
+    let mut exit_code = 0;
 
     match &cli.command {
-        Command::Ports { only_micropython } => {
-            cmd_ports(cli.json, *only_micropython)?;
+        Command::Ports {
+            only_micropython,
+            probe,
+        } => {
+            cmd_ports(&cli, *only_micropython, *probe)?;
         }
         Command::Ls {
             path,
             recursive,
             long,
         } => {
-            let port = require_port(&cli)?;
+            let opts = device_opts(&cli)?;
             let path_str = path.as_deref().unwrap_or("/");
-            cmd_ls(&port, path_str, *recursive, *long, cli.json)?;
+            cmd_ls(&opts, path_str, *recursive, *long, cli.json)?;
         }
         Command::Cat { path } => {
-            let port = require_port(&cli)?;
-            cmd_cat(&port, path)?;
+            let opts = device_opts(&cli)?;
+            cmd_cat(&opts, path)?;
         }
         Command::Init { template, dest } => {
             cmd_init(template, dest.as_deref(), cli.quiet)?;
         }
         Command::Put { local, remote } => {
-            let port = require_port(&cli)?;
-            cmd_put(&port, local, remote)?;
+            let opts = device_opts(&cli)?;
+            cmd_put(&opts, local, remote)?;
         }
         Command::Get { remote, local } => {
-            let port = require_port(&cli)?;
-            cmd_get(&port, remote, local)?;
+            let opts = device_opts(&cli)?;
+            cmd_get(&opts, remote, local)?;
         }
         Command::Rm { path } => {
-            let port = require_port(&cli)?;
-            cmd_rm(&port, path)?;
+            let opts = device_opts(&cli)?;
+            cmd_rm(&opts, path)?;
         }
         Command::Mkdir { path } => {
-            let port = require_port(&cli)?;
-            cmd_mkdir(&port, path)?;
+            let opts = device_opts(&cli)?;
+            cmd_mkdir(&opts, path)?;
         }
         Command::Run { path } => {
-            let port = require_port(&cli)?;
-            cmd_run(&port, path, cli.quiet)?;
+            let opts = device_opts(&cli)?;
+            exit_code = cmd_run(&opts, path, cli.quiet)?;
         }
         Command::RunLocal { path } => {
-            let port = require_port(&cli)?;
-            cmd_run_local(&port, path, cli.quiet)?;
+            let opts = device_opts(&cli)?;
+            exit_code = cmd_run_local(&opts, path, cli.quiet)?;
         }
         Command::RunSnippet { code } => {
-            let port = require_port(&cli)?;
-            cmd_run_snippet(&port, code, cli.quiet)?;
+            let opts = device_opts(&cli)?;
+            exit_code = cmd_run_snippet(&opts, code, cli.quiet)?;
         }
         Command::FlashMain { local } => {
-            let port = require_port(&cli)?;
-            cmd_flash_main(&port, local)?;
+            let opts = device_opts(&cli)?;
+            cmd_flash_main(&opts, local)?;
         }
         Command::RunMain => {
-            let port = require_port(&cli)?;
-            cmd_run_main(&port)?;
+            let opts = device_opts(&cli)?;
+            cmd_run_main(&opts)?;
         }
         Command::Stop => {
-            let port = require_port(&cli)?;
-            cmd_stop(&port, cli.quiet)?;
+            let opts = device_opts(&cli)?;
+            cmd_stop(&opts, cli.quiet)?;
         }
         Command::SyncToDevice {
             local,
@@ -299,18 +353,25 @@ fn try_main() -> Result<(), Box<dyn Error>> {
             verbose,
             ignore,
         } => {
-            let port = require_port(&cli)?;
-            let effective_verbose = *verbose && !cli.quiet;
-            cmd_sync_to_device(
-                &port,
-                local,
+            let opts = device_opts(&cli)?;
+            let sync_opts = sync::SyncOptions {
+                delete: *delete,
+                dry_run: *dry_run,
+                ignore: ignore.clone(),
+                // The low-level commands keep no baseline, so they never
+                // detect conflicts and `force` is irrelevant to them.
+                force: true,
+            };
+            run_sync(
+                &opts,
+                Path::new(local),
                 remote,
-                *delete,
-                *dry_run,
-                effective_verbose,
-                ignore.clone(),
-                cli.json,
+                false,
+                &sync_opts,
                 None,
+                cli.quiet,
+                cli.json,
+                *verbose && !cli.quiet,
             )?;
         }
         Command::SyncFromDevice {
@@ -321,18 +382,23 @@ fn try_main() -> Result<(), Box<dyn Error>> {
             verbose,
             ignore,
         } => {
-            let port = require_port(&cli)?;
-            let effective_verbose = *verbose && !cli.quiet;
-            cmd_sync_from_device(
-                &port,
+            let opts = device_opts(&cli)?;
+            let sync_opts = sync::SyncOptions {
+                delete: *delete,
+                dry_run: *dry_run,
+                ignore: ignore.clone(),
+                force: true,
+            };
+            run_sync(
+                &opts,
+                Path::new(local),
                 remote,
-                local,
-                *delete,
-                *dry_run,
-                effective_verbose,
-                ignore.clone(),
-                cli.json,
+                true,
+                &sync_opts,
                 None,
+                cli.quiet,
+                cli.json,
+                *verbose && !cli.quiet,
             )?;
         }
         Command::Sync {
@@ -341,116 +407,153 @@ fn try_main() -> Result<(), Box<dyn Error>> {
             dry_run,
             verbose,
             ignore,
+            force,
         } => {
-            let port = require_port(&cli)?;
-            let effective_verbose = *verbose && !cli.quiet;
-            let (workspace_root, cfg) = find_workspace_config()?;
-            let mut state = load_workspace_state(&workspace_root);
+            let opts = device_opts(&cli)?;
+            let sync_opts = sync::SyncOptions {
+                delete: *delete,
+                dry_run: *dry_run,
+                ignore: ignore.clone(),
+                force: *force,
+            };
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs());
-
+            let cwd = std::env::current_dir()?;
+            let (workspace_root, cfg) = sync::find_workspace_config(&cwd)?;
+            let mut state = sync::load_workspace_state(&workspace_root);
             let local_root = workspace_root.join(&cfg.local_root);
-            let local_root_str = local_root.display().to_string();
-            let remote_root = cfg.remote_root;
 
-            if *from_device {
-                let last = state.last_sync_from_device;
-                cmd_sync_from_device(
-                    &port,
-                    &remote_root,
-                    &local_root_str,
-                    *delete,
-                    *dry_run,
-                    effective_verbose,
-                    ignore.clone(),
-                    cli.json,
-                    last,
-                )?;
-                if !*dry_run
-                    && let Some(t) = now {
+            // Content-hash manifest from the last successful sync, used for
+            // conflict detection.
+            let baseline = state.files.clone();
+
+            let outcome = run_sync(
+                &opts,
+                &local_root,
+                &cfg.remote_root,
+                *from_device,
+                &sync_opts,
+                Some(&baseline),
+                cli.quiet,
+                cli.json,
+                *verbose && !cli.quiet,
+            )?;
+
+            if !*dry_run {
+                state.files = outcome.manifest.clone();
+                if let Some(t) = sync::now_secs() {
+                    if *from_device {
                         state.last_sync_from_device = Some(t);
-                        let _ = save_workspace_state(&workspace_root, &state);
-                    }
-            } else {
-                let last = state.last_sync_to_device;
-                cmd_sync_to_device(
-                    &port,
-                    &local_root_str,
-                    &remote_root,
-                    *delete,
-                    *dry_run,
-                    effective_verbose,
-                    ignore.clone(),
-                    cli.json,
-                    last,
-                )?;
-                if !*dry_run
-                    && let Some(t) = now {
+                    } else {
                         state.last_sync_to_device = Some(t);
-                        let _ = save_workspace_state(&workspace_root, &state);
                     }
+                }
+                sync::save_workspace_state(&workspace_root, &state)?;
+            }
+
+            if outcome.conflicts > 0 {
+                eprintln!(
+                    "{} file(s) changed on both sides and were left untouched. \
+                     Inspect them, then re-run with --force to overwrite, or copy \
+                     the side you want across by hand.",
+                    outcome.conflicts
+                );
+                exit_code = EXIT_CONFLICT;
             }
         }
         Command::Repl => {
-            let port = require_port(&cli)?;
-            cmd_repl(&port, cli.quiet)?;
+            let opts = device_opts(&cli)?;
+            cmd_repl(&opts, cli.quiet)?;
         }
     }
 
-    Ok(())
+    Ok(exit_code)
 }
 
-fn require_port(cli: &Cli) -> Result<String, Box<dyn Error>> {
-    match &cli.port {
-        Some(p) => Ok(p.clone()),
-        None => {
-            eprintln!("error: --port is required for this command");
-            std::process::exit(1);
-        }
-    }
+/// Build connection options from CLI flags, failing with a proper error
+/// (rather than exiting) when `--port` is missing.
+fn device_opts(cli: &Cli) -> Result<DeviceOpts, Box<dyn Error>> {
+    let port = match &cli.port {
+        Some(p) => p.clone(),
+        None => return Err("--port is required for this command".into()),
+    };
+    let read_timeout = if cli.timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(cli.timeout_secs))
+    };
+    Ok(DeviceOpts {
+        port,
+        baud: cli.baud,
+        read_timeout,
+    })
 }
 
-fn with_raw_device<F, T>(port: &str, f: F) -> Result<T, Box<dyn Error>>
+/// Timeout used for the raw-REPL handshake. Kept finite even when the exec
+/// timeout is disabled so a dead device still fails fast.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn open_device(opts: &DeviceOpts) -> micropython::Result<micropython::MicroPythonDevice> {
+    let mut dev = micropython::MicroPythonDevice::open(&opts.port, opts.baud, HANDSHAKE_TIMEOUT)?;
+    dev.set_read_timeout(opts.read_timeout);
+    Ok(dev)
+}
+
+fn with_raw_device<F, T>(opts: &DeviceOpts, f: F) -> Result<T, Box<dyn Error>>
 where
     F: FnOnce(&mut micropython::MicroPythonDevice) -> micropython::Result<T>,
 {
-    let mut dev = micropython::MicroPythonDevice::connect(port)?;
+    let mut dev = open_device(opts)?;
     dev.enter_raw_repl()?;
     let result = f(&mut dev);
     let _ = dev.exit_raw_repl();
     Ok(result?)
 }
 
-fn cmd_ports(json: bool, only_micropython: bool) -> Result<(), Box<dyn Error>> {
+fn cmd_ports(cli: &Cli, only_micropython: bool, probe: bool) -> Result<(), Box<dyn Error>> {
     let ports = available_ports()?;
 
-    if json {
-        let mut arr = Vec::new();
-        for p in ports {
-            let is_mp = is_micropython_port(&p.port_name);
-            if only_micropython && !is_mp {
-                continue;
-            }
-            arr.push(serde_json::json!({
-                "port": p.port_name,
-                "is_micropython": is_mp,
-            }));
+    let mut results: Vec<(String, bool)> = Vec::new();
+    for p in &ports {
+        let candidate = vid_looks_micropython(&p.port_type);
+        // Passive by default: classify by USB vendor ID and never write to a
+        // port, so unrelated serial hardware (CNC controllers, printers,
+        // UPSes, ...) is left alone.
+        //
+        // `--probe` is the explicit opt-in to writing, and it has to widen
+        // the search rather than narrow it: probing only VID matches could
+        // just demote a port, leaving a board on a generic USB-serial bridge
+        // undetectable under every flag combination.
+        let is_mp = if probe {
+            candidate || is_micropython_port(cli, &p.port_name)
+        } else {
+            candidate
+        };
+        if only_micropython && !is_mp {
+            continue;
         }
-        let value = serde_json::Value::Array(arr);
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        results.push((p.port_name.clone(), is_mp));
+    }
+
+    if cli.json {
+        let arr: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(name, is_mp)| {
+                serde_json::json!({
+                    "port": name,
+                    "is_micropython": is_mp,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
+        );
     } else {
-        for p in ports {
-            let is_mp = is_micropython_port(&p.port_name);
-            if only_micropython && !is_mp {
-                continue;
-            }
+        for (name, is_mp) in results {
             if is_mp {
-                println!("[mp] {}", p.port_name);
+                println!("[mp] {}", name);
             } else {
-                println!("{}", p.port_name);
+                println!("{}", name);
             }
         }
     }
@@ -458,8 +561,13 @@ fn cmd_ports(json: bool, only_micropython: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn is_micropython_port(port: &str) -> bool {
-    let res: Result<bool, Box<dyn Error>> = with_raw_device(port, |dev| {
+fn is_micropython_port(cli: &Cli, port: &str) -> bool {
+    let opts = DeviceOpts {
+        port: port.to_string(),
+        baud: cli.baud,
+        read_timeout: Some(HANDSHAKE_TIMEOUT),
+    };
+    let res: Result<bool, Box<dyn Error>> = with_raw_device(&opts, |dev| {
         let out = dev.run_snippet("import sys\nprint(sys.implementation[0])")?;
         Ok(out.stdout.to_lowercase().contains("micropython"))
     });
@@ -467,7 +575,7 @@ fn is_micropython_port(port: &str) -> bool {
 }
 
 fn cmd_ls(
-    port: &str,
+    opts: &DeviceOpts,
     path: &str,
     recursive: bool,
     long: bool,
@@ -475,11 +583,11 @@ fn cmd_ls(
 ) -> Result<(), Box<dyn Error>> {
     if json {
         if !recursive {
-            let entries = with_raw_device(port, |dev| dev.list_dir(path))?;
+            let entries = with_raw_device(opts, |dev| dev.list_dir(path))?;
             let value = ls_entries_to_json(path, entries);
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
-            let entries = with_raw_device(port, |dev| {
+            let entries = with_raw_device(opts, |dev| {
                 let mut out = Vec::<(String, RemoteInfo)>::new();
                 collect_remote_entries(dev, path, "", &mut out)?;
                 Ok(out)
@@ -489,7 +597,7 @@ fn cmd_ls(
         }
         Ok(())
     } else if !recursive {
-        with_raw_device(port, |dev| {
+        with_raw_device(opts, |dev| {
             let entries = dev.list_dir(path)?;
             for e in entries {
                 if long {
@@ -516,15 +624,15 @@ fn cmd_ls(
             Ok(())
         })
     } else {
-        with_raw_device(port, |dev| {
+        with_raw_device(opts, |dev| {
             print_tree(dev, path, 0, long)?;
             Ok(())
         })
     }
 }
 
-fn cmd_cat(port: &str, path: &str) -> Result<(), Box<dyn Error>> {
-    with_raw_device(port, |dev| {
+fn cmd_cat(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
+    with_raw_device(opts, |dev| {
         let contents = dev.read_text_file(path)?;
         print!("{}", contents);
         io::stdout().flush()?;
@@ -602,124 +710,276 @@ fn cmd_init_uart(dest: Option<&str>, quiet: bool) -> Result<(), Box<dyn Error>> 
     init_template_common("uart", dest, "uart.py", UART_TEMPLATE_UART_PY, quiet)
 }
 
-fn cmd_put(port: &str, local: &str, remote: &str) -> Result<(), Box<dyn Error>> {
+fn cmd_put(opts: &DeviceOpts, local: &str, remote: &str) -> Result<(), Box<dyn Error>> {
     let data = fs::read(local)?;
-    with_raw_device(port, |dev| {
+    with_raw_device(opts, |dev| {
         dev.write_file(remote, &data)?;
         Ok(())
     })
 }
 
-fn cmd_get(port: &str, remote: &str, local: &str) -> Result<(), Box<dyn Error>> {
-    let data = with_raw_device(port, |dev| dev.read_file(remote))?;
+fn cmd_get(opts: &DeviceOpts, remote: &str, local: &str) -> Result<(), Box<dyn Error>> {
+    let data = with_raw_device(opts, |dev| dev.read_file(remote))?;
     fs::write(local, data)?;
     Ok(())
 }
 
-fn cmd_rm(port: &str, path: &str) -> Result<(), Box<dyn Error>> {
-    with_raw_device(port, |dev| {
+fn cmd_rm(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
+    with_raw_device(opts, |dev| {
         dev.remove(path)?;
         Ok(())
     })
 }
 
-fn cmd_mkdir(port: &str, path: &str) -> Result<(), Box<dyn Error>> {
-    with_raw_device(port, |dev| {
+fn cmd_mkdir(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
+    with_raw_device(opts, |dev| {
         dev.mkdir(path)?;
         Ok(())
     })
 }
 
-fn cmd_run(port: &str, path: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
-    with_raw_device(port, |dev| {
-        let res = dev.run_file(path)?;
-        let use_color = io::stdout().is_terminal() && !quiet;
-        if quiet {
-            // In quiet mode, print raw stdout+stderr without extra labels.
-            print!("{}{}", res.stdout, res.stderr);
-        } else if use_color {
-            println!("\x1b[32m--- stdout ---\x1b[0m");
-            print!("{}", res.stdout);
-            println!("\x1b[31m--- stderr ---\x1b[0m");
-            print!("\x1b[31m{}\x1b[0m", res.stderr);
-        } else {
-            println!("--- stdout ---");
-            print!("{}", res.stdout);
-            println!("--- stderr ---");
-            print!("{}", res.stderr);
+/// Print one sync decision in human-readable form.
+///
+/// The engine reports each action as it happens, so this runs live rather than
+/// after the fact.
+fn print_sync_action(dir: &str, action: &sync::SyncAction, verbose: bool) {
+    let arrow = |a: &sync::SyncAction| {
+        format!(
+            "{} -> {}",
+            a.local.as_deref().unwrap_or("?"),
+            a.remote.as_deref().unwrap_or("?")
+        )
+    };
+    let target = |a: &sync::SyncAction| {
+        a.remote
+            .as_deref()
+            .or(a.local.as_deref())
+            .unwrap_or("?")
+            .to_string()
+    };
+
+    // Warnings and conflicts always surface; the rest only with -v.
+    match action.op.as_str() {
+        "warning" => {
+            eprintln!("warning: {}", action.note.as_deref().unwrap_or(""));
+            return;
         }
+        "conflict" => {
+            eprintln!(
+                "{dir}: WARNING: both local and remote changed since last sync for {} ({})",
+                target(action),
+                if action.dry_run { "dry run" } else { "skipped" }
+            );
+            return;
+        }
+        op if op.starts_with("skip_delete_") => {
+            eprintln!(
+                "{dir}: WARNING: could not delete {} (skipped): {}",
+                target(action),
+                action.note.as_deref().unwrap_or("")
+            );
+            return;
+        }
+        _ => {}
+    }
+
+    if action.dry_run {
+        let what = match action.op.as_str() {
+            "upload" => format!("would upload {}", arrow(action)),
+            "download" => format!("would download {}", arrow(action)),
+            "delete_remote_file" => format!("would delete remote file {}", target(action)),
+            "delete_remote_dir" => format!("would delete remote directory {}", target(action)),
+            "delete_local_file" => format!("would delete local file {}", target(action)),
+            "delete_local_dir" => format!("would delete local directory {}", target(action)),
+            "remove_stale_staging" => {
+                format!("would remove stale staging file {}", target(action))
+            }
+            _ => return,
+        };
+        println!("DRY RUN: {what}");
+        return;
+    }
+
+    if !verbose {
+        return;
+    }
+    let what = match action.op.as_str() {
+        "upload" => format!("uploading {}", arrow(action)),
+        "download" => format!("downloading {}", arrow(action)),
+        "skip_upload" | "skip_download" => format!("skipping unchanged {}", target(action)),
+        "delete_remote_file" | "delete_local_file" => format!("deleting {}", target(action)),
+        "delete_remote_dir" | "delete_local_dir" => {
+            format!("deleting directory {}", target(action))
+        }
+        "ensure_dir" => format!("ensuring directory {}", target(action)),
+        "remove_stale_staging" => format!("removing stale staging file {}", target(action)),
+        _ => return,
+    };
+    println!("{dir}: {what}");
+}
+
+/// Emit the `--json` summary for a completed sync.
+fn print_sync_json(
+    direction: &str,
+    local_root: &str,
+    remote_root: &str,
+    outcome: &sync::SyncOutcome,
+) -> Result<(), Box<dyn Error>> {
+    let summary = serde_json::json!({
+        "direction": direction,
+        "local_root": local_root,
+        "remote_root": remote_root,
+        "actions": outcome.actions,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+/// Run one sync in either direction, printing progress as it goes.
+#[allow(clippy::too_many_arguments)]
+fn run_sync(
+    opts: &DeviceOpts,
+    local_root: &Path,
+    remote_root: &str,
+    from_device: bool,
+    sync_opts: &sync::SyncOptions,
+    baseline: Option<&HashMap<String, String>>,
+    quiet: bool,
+    json: bool,
+    verbose: bool,
+) -> Result<sync::SyncOutcome, Box<dyn Error>> {
+    let dir = if from_device {
+        "sync-from-device"
+    } else {
+        "sync-to-device"
+    };
+    // In JSON mode the machine-readable summary is the output; live text would
+    // corrupt it.
+    let chatty = !json && !quiet;
+    let mut report = |a: &sync::SyncAction| {
+        if chatty {
+            print_sync_action(dir, a, verbose);
+        }
+    };
+
+    let outcome = with_raw_device(opts, |dev| {
+        if from_device {
+            sync::from_device(
+                dev,
+                remote_root,
+                local_root,
+                sync_opts,
+                baseline,
+                Some(&mut report),
+            )
+        } else {
+            sync::to_device(
+                dev,
+                local_root,
+                remote_root,
+                sync_opts,
+                baseline,
+                Some(&mut report),
+            )
+        }
+    })?;
+
+    if json {
+        let direction = if from_device {
+            "from_device"
+        } else {
+            "to_device"
+        };
+        print_sync_json(
+            direction,
+            &local_root.display().to_string(),
+            remote_root,
+            &outcome,
+        )?;
+    }
+
+    Ok(outcome)
+}
+
+/// Print an execution result's stdout/stderr, with labeled (and colorized,
+/// when stdout is a TTY) sections unless `quiet` is set.
+///
+/// Returns the process exit code to use: code that raised on the device is
+/// reported as a failure so a script can tell a clean run from a traceback.
+fn print_exec_result(res: &micropython::ExecResult, quiet: bool) -> io::Result<i32> {
+    let use_color = io::stdout().is_terminal() && !quiet;
+    if quiet {
+        // Quiet mode is the scripting mode, so keep the streams separate:
+        // folding the device's stderr into stdout corrupts captured output.
+        print!("{}", res.stdout);
         io::stdout().flush()?;
-        Ok(())
+        eprint!("{}", res.stderr);
+    } else if use_color {
+        println!("\x1b[32m--- stdout ---\x1b[0m");
+        print!("{}", res.stdout);
+        println!("\x1b[31m--- stderr ---\x1b[0m");
+        print!("\x1b[31m{}\x1b[0m", res.stderr);
+    } else {
+        println!("--- stdout ---");
+        print!("{}", res.stdout);
+        println!("--- stderr ---");
+        print!("{}", res.stderr);
+    }
+    io::stdout().flush()?;
+
+    if res.stderr.trim().is_empty() {
+        Ok(0)
+    } else {
+        Ok(EXIT_DEVICE_ERROR)
+    }
+}
+
+fn cmd_run(opts: &DeviceOpts, path: &str, quiet: bool) -> Result<i32, Box<dyn Error>> {
+    with_raw_device(opts, |dev| {
+        let res = dev.run_file(path)?;
+        Ok(print_exec_result(&res, quiet)?)
     })
 }
 
-fn cmd_run_local(port: &str, local: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
+fn cmd_run_local(opts: &DeviceOpts, local: &str, quiet: bool) -> Result<i32, Box<dyn Error>> {
     let source = fs::read_to_string(local)?;
-    const REMOTE_TEMP: &str = "/__rupico_temp__.py";
-    with_raw_device(port, |dev| {
-        dev.write_text_file(REMOTE_TEMP, &source)?;
-        let res = dev.run_file(REMOTE_TEMP);
+    // Include the pid so two rupico processes driving the same board do not
+    // overwrite each other's staged script.
+    let remote_temp = format!("/__rupico_temp_{}__.py", std::process::id());
+    with_raw_device(opts, |dev| {
+        dev.write_text_file(&remote_temp, &source)?;
+        let res = dev.run_file(&remote_temp);
         // Best-effort cleanup: remove the temp file regardless of whether
         // execution succeeded so we don't leave stale files on flash storage.
-        let _ = dev.remove(REMOTE_TEMP);
+        let _ = dev.remove(&remote_temp);
         let res = res?;
-        let use_color = io::stdout().is_terminal() && !quiet;
-        if quiet {
-            print!("{}{}", res.stdout, res.stderr);
-        } else if use_color {
-            println!("\x1b[32m--- stdout ---\x1b[0m");
-            print!("{}", res.stdout);
-            println!("\x1b[31m--- stderr ---\x1b[0m");
-            print!("\x1b[31m{}\x1b[0m", res.stderr);
-        } else {
-            println!("--- stdout ---");
-            print!("{}", res.stdout);
-            println!("--- stderr ---");
-            print!("{}", res.stderr);
-        }
-        io::stdout().flush()?;
-        Ok(())
+        Ok(print_exec_result(&res, quiet)?)
     })
 }
 
-fn cmd_run_snippet(port: &str, code: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
-    with_raw_device(port, |dev| {
+fn cmd_run_snippet(opts: &DeviceOpts, code: &str, quiet: bool) -> Result<i32, Box<dyn Error>> {
+    with_raw_device(opts, |dev| {
         let res = dev.run_snippet(code)?;
-        let use_color = io::stdout().is_terminal() && !quiet;
-        if quiet {
-            print!("{}{}", res.stdout, res.stderr);
-        } else if use_color {
-            println!("\x1b[32m--- stdout ---\x1b[0m");
-            print!("{}", res.stdout);
-            println!("\x1b[31m--- stderr ---\x1b[0m");
-            print!("\x1b[31m{}\x1b[0m", res.stderr);
-        } else {
-            println!("--- stdout ---");
-            print!("{}", res.stdout);
-            println!("--- stderr ---");
-            print!("{}", res.stderr);
-        }
-        io::stdout().flush()?;
-        Ok(())
+        Ok(print_exec_result(&res, quiet)?)
     })
 }
 
-fn cmd_flash_main(port: &str, local: &str) -> Result<(), Box<dyn Error>> {
+fn cmd_flash_main(opts: &DeviceOpts, local: &str) -> Result<(), Box<dyn Error>> {
     let source = fs::read_to_string(local)?;
-    with_raw_device(port, |dev| {
+    with_raw_device(opts, |dev| {
         dev.flash_main_script(&source)?;
         Ok(())
     })
 }
 
-fn cmd_run_main(port: &str) -> Result<(), Box<dyn Error>> {
-    let mut dev = micropython::MicroPythonDevice::connect(port)?;
+fn cmd_run_main(opts: &DeviceOpts) -> Result<(), Box<dyn Error>> {
+    let mut dev = open_device(opts)?;
     dev.run_main()?;
     Ok(())
 }
 
-fn cmd_stop(port: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
-    let mut dev = micropython::MicroPythonDevice::connect(port)?;
+fn cmd_stop(opts: &DeviceOpts, quiet: bool) -> Result<(), Box<dyn Error>> {
+    let mut dev = open_device(opts)?;
     dev.stop_current_program()?;
     if !quiet {
         eprintln!("Sent Ctrl-C to stop current program on the device.");
@@ -768,16 +1028,34 @@ fn print_tree(
     Ok(())
 }
 
-fn cmd_repl(port_path: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
-    let mut port = serialport::new(port_path, 115_200)
+fn cmd_repl(opts: &DeviceOpts, quiet: bool) -> Result<(), Box<dyn Error>> {
+    let mut port = serialport::new(&opts.port, opts.baud)
         .timeout(Duration::from_millis(100))
         .open()?;
 
     if !quiet {
-        println!("Entering REPL on {}. Press Ctrl-C to quit.", port_path);
+        println!(
+            "Entering REPL on {}. Ctrl-C interrupts the running program on the device; press Ctrl-D to exit.",
+            opts.port
+        );
     }
     port.write_all(b"\r\n")?;
     port.flush()?;
+
+    // Forward Ctrl-C to the device (to interrupt whatever is running there)
+    // instead of letting it kill this process. Exit the proxy with Ctrl-D
+    // (EOF on stdin).
+    let int_port = std::sync::Mutex::new(port.try_clone()?);
+    ctrlc::set_handler(move || {
+        if let Ok(mut p) = int_port.lock() {
+            // If the board went away, Ctrl-C would otherwise be a silent
+            // no-op and the session would just look wedged.
+            if let Err(e) = p.write_all(&[0x03]).and_then(|()| p.flush()) {
+                eprintln!("\nrupico: could not forward Ctrl-C to the device: {e}");
+                eprintln!("rupico: press Ctrl-D to exit the REPL proxy.");
+            }
+        }
+    })?;
 
     let mut reader = port.try_clone()?;
 
@@ -819,504 +1097,6 @@ fn cmd_repl(port_path: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_sync_to_device(
-    port: &str,
-    local: &str,
-    remote: &str,
-    delete: bool,
-    dry_run: bool,
-    verbose: bool,
-    extra_ignores: Vec<String>,
-    json: bool,
-    last_sync_time: Option<u64>,
-) -> Result<(), Box<dyn Error>> {
-    let local_root = PathBuf::from(local);
-    let mut entries = Vec::<(PathBuf, bool)>::new();
-    collect_local_entries(&local_root, Path::new(""), &mut entries)?;
-
-    let ignore_patterns = build_ignore_patterns(&local_root, &extra_ignores)?;
-    entries.retain(|(rel, _)| !path_is_ignored(rel, &ignore_patterns));
-
-    // Build metadata map for local files/dirs.
-    let mut local_files: HashMap<String, LocalInfo> = HashMap::new();
-    for (rel, is_dir) in &entries {
-        let rel_str = rel_path_to_remote(rel);
-        if *is_dir {
-            local_files.insert(
-                rel_str,
-                LocalInfo {
-                    is_dir: true,
-                    size: 0,
-                    modified: None,
-                },
-            );
-        } else {
-            let meta = fs::metadata(local_root.join(rel))?;
-            let size = meta.len();
-            let modified = meta.modified().ok().and_then(system_time_to_unix);
-            local_files.insert(
-                rel_str,
-                LocalInfo {
-                    is_dir: false,
-                    size,
-                    modified,
-                },
-            );
-        }
-    }
-
-    let local_paths: HashSet<String> = local_files.keys().cloned().collect();
-
-    let ignore_patterns_clone = ignore_patterns.clone();
-    let mut actions: Vec<SyncAction> = Vec::new();
-
-    with_raw_device(port, |dev| {
-        let mut remote_entries = Vec::<(String, RemoteInfo)>::new();
-        collect_remote_entries(dev, remote, "", &mut remote_entries)?;
-        remote_entries.retain(|(rel, _)| {
-            let rel_path = PathBuf::from(rel);
-            !path_is_ignored(&rel_path, &ignore_patterns_clone)
-        });
-        let remote_map: HashMap<String, RemoteInfo> = remote_entries.iter().cloned().collect();
-
-        if delete {
-            // Remote entries that are not present locally should be deleted
-            // from the device. We delete deeper paths first so directories
-            // become empty before we try to remove them.
-            let mut to_delete: Vec<(String, bool)> = remote_entries
-                .iter()
-                .filter(|(rel, _)| !local_paths.contains(rel))
-                .map(|(rel, info)| (rel.clone(), info.is_dir))
-                .collect();
-
-            to_delete.sort_by(|(a, _), (b, _)| {
-                let depth_a = a.matches('/').count();
-                let depth_b = b.matches('/').count();
-                depth_b.cmp(&depth_a)
-            });
-
-            for (rel, is_dir) in to_delete {
-                let full = join_remote_path(remote, &rel);
-                if dry_run {
-                    if !json {
-                        if is_dir {
-                            println!("DRY RUN: would delete remote directory {}", full);
-                        } else {
-                            println!("DRY RUN: would delete remote file {}", full);
-                        }
-                    }
-                    actions.push(SyncAction {
-                        op: if is_dir {
-                            "delete_remote_dir".to_string()
-                        } else {
-                            "delete_remote_file".to_string()
-                        },
-                        local: None,
-                        remote: Some(full.clone()),
-                        dry_run: true,
-                    });
-                } else if is_dir {
-                    if verbose && !json {
-                        println!("sync-to-device: deleting remote directory {}", full);
-                    }
-                    dev.rmdir(&full)?;
-                    actions.push(SyncAction {
-                        op: "delete_remote_dir".to_string(),
-                        local: None,
-                        remote: Some(full.clone()),
-                        dry_run: false,
-                    });
-                } else {
-                    if verbose && !json {
-                        println!("sync-to-device: deleting remote file {}", full);
-                    }
-                    dev.remove(&full)?;
-                    actions.push(SyncAction {
-                        op: "delete_remote_file".to_string(),
-                        local: None,
-                        remote: Some(full.clone()),
-                        dry_run: false,
-                    });
-                }
-            }
-        }
-
-        // Upload/update all local entries.
-        for (rel, is_dir) in &entries {
-            let rel_remote = rel_path_to_remote(rel);
-            let remote_path = join_remote_path(remote, &rel_remote);
-            let local_path = local_root.join(rel);
-            if *is_dir {
-                let _ = dev.mkdir(&remote_path);
-            } else {
-                let local_info = local_files
-                    .get(&rel_remote)
-                    .expect("local_files missing entry that exists in entries");
-                let remote_info = remote_map.get(&rel_remote);
-
-                // Detect "both changed" conflicts based on last sync time, if
-                // we have one and both sides report modification times.
-                if let Some(t0) = last_sync_time
-                    && let Some(info) = remote_info
-                        && let (Some(lm), Some(rm)) = (local_info.modified, info.modified)
-                            && lm > t0 && rm > t0 && lm != rm {
-                                if !json {
-                                    eprintln!(
-                                        "sync-to-device: WARNING: both local and remote changed since last sync for {}",
-                                        remote_path
-                                    );
-                                }
-                                actions.push(SyncAction {
-                                    op: "conflict".to_string(),
-                                    local: Some(local_path.display().to_string()),
-                                    remote: Some(remote_path.clone()),
-                                    dry_run,
-                                });
-                            }
-
-                let should_upload = match remote_info {
-                    None => true,
-                    Some(info) => {
-                        if info.is_dir {
-                            true
-                        } else {
-                            !matches!(
-                                (local_info.modified, info.modified),
-                                (Some(lm), Some(rm))
-                                    if lm == rm && local_info.size == info.size
-                            )
-                        }
-                    }
-                };
-
-                if should_upload {
-                    if dry_run {
-                        if !json {
-                            println!(
-                                "DRY RUN: would upload {} -> {}",
-                                local_path.display(),
-                                remote_path
-                            );
-                        }
-                        actions.push(SyncAction {
-                            op: "upload".to_string(),
-                            local: Some(local_path.display().to_string()),
-                            remote: Some(remote_path.clone()),
-                            dry_run: true,
-                        });
-                    } else {
-                        if verbose && !json {
-                            println!(
-                                "sync-to-device: uploading {} -> {}",
-                                local_path.display(),
-                                remote_path
-                            );
-                        }
-                        let data =
-                            fs::read(&local_path).map_err(micropython::MicroPythonError::Io)?;
-                        dev.write_file(&remote_path, &data)?;
-                        actions.push(SyncAction {
-                            op: "upload".to_string(),
-                            local: Some(local_path.display().to_string()),
-                            remote: Some(remote_path.clone()),
-                            dry_run: false,
-                        });
-                    }
-                } else {
-                    if verbose && !json {
-                        println!("sync-to-device: skipping unchanged {}", remote_path);
-                    }
-                    actions.push(SyncAction {
-                        op: "skip_upload".to_string(),
-                        local: Some(local_path.display().to_string()),
-                        remote: Some(remote_path.clone()),
-                        dry_run: false,
-                    });
-                }
-            }
-        }
-        Ok(())
-    })?;
-
-    if json {
-        let summary = serde_json::json!({
-            "direction": "to_device",
-            "local_root": local_root.display().to_string(),
-            "remote_root": remote,
-            "actions": actions,
-        });
-        println!("{}", serde_json::to_string_pretty(&summary)?);
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_sync_from_device(
-    port: &str,
-    remote: &str,
-    local: &str,
-    delete: bool,
-    dry_run: bool,
-    verbose: bool,
-    extra_ignores: Vec<String>,
-    json: bool,
-    last_sync_time: Option<u64>,
-) -> Result<(), Box<dyn Error>> {
-    let local_root = PathBuf::from(local);
-
-    let ignore_patterns = build_ignore_patterns(&local_root, &extra_ignores)?;
-    let ignore_patterns_clone = ignore_patterns.clone();
-
-    // Build metadata map for existing local files/dirs.
-    let mut local_entries = Vec::<(PathBuf, bool)>::new();
-    collect_local_entries(&local_root, Path::new(""), &mut local_entries)?;
-    local_entries.retain(|(rel, _)| !path_is_ignored(rel, &ignore_patterns));
-    let mut local_files: HashMap<String, LocalInfo> = HashMap::new();
-    for (rel, is_dir) in &local_entries {
-        let rel_str = rel_path_to_remote(rel);
-        if *is_dir {
-            local_files.insert(
-                rel_str,
-                LocalInfo {
-                    is_dir: true,
-                    size: 0,
-                    modified: None,
-                },
-            );
-        } else {
-            let meta = fs::metadata(local_root.join(rel))?;
-            let size = meta.len();
-            let modified = meta.modified().ok().and_then(system_time_to_unix);
-            local_files.insert(
-                rel_str,
-                LocalInfo {
-                    is_dir: false,
-                    size,
-                    modified,
-                },
-            );
-        }
-    }
-
-    let mut actions: Vec<SyncAction> = Vec::new();
-
-    with_raw_device(port, |dev| {
-        let mut remote_entries = Vec::<(String, RemoteInfo)>::new();
-        collect_remote_entries(dev, remote, "", &mut remote_entries)?;
-        remote_entries.retain(|(rel, _)| {
-            let rel_path = PathBuf::from(rel);
-            !path_is_ignored(&rel_path, &ignore_patterns_clone)
-        });
-        let remote_map: HashMap<String, RemoteInfo> = remote_entries.iter().cloned().collect();
-
-        if delete {
-            // Local entries that are not present on the device should be
-            // removed on the host.
-            let remote_paths: HashSet<String> = remote_map.keys().cloned().collect();
-
-            let mut to_delete: Vec<(PathBuf, bool)> = local_entries
-                .iter()
-                .filter(|(rel, _)| {
-                    let rel_str = rel_path_to_remote(rel);
-                    !remote_paths.contains(&rel_str)
-                })
-                .map(|(rel, is_dir)| (rel.clone(), *is_dir))
-                .collect();
-
-            // Delete deeper paths first so directories are empty before we
-            // try to remove them.
-            to_delete.sort_by(|(a, _), (b, _)| {
-                let depth_a = a.components().count();
-                let depth_b = b.components().count();
-                depth_b.cmp(&depth_a)
-            });
-
-            for (rel, is_dir) in to_delete {
-                let full = local_root.join(&rel);
-                if dry_run {
-                    if !json {
-                        if is_dir {
-                            println!("DRY RUN: would delete local directory {}", full.display());
-                        } else {
-                            println!("DRY RUN: would delete local file {}", full.display());
-                        }
-                    }
-                    actions.push(SyncAction {
-                        op: if is_dir {
-                            "delete_local_dir".to_string()
-                        } else {
-                            "delete_local_file".to_string()
-                        },
-                        local: Some(full.display().to_string()),
-                        remote: None,
-                        dry_run: true,
-                    });
-                } else if is_dir {
-                    if verbose && !json {
-                        println!(
-                            "sync-from-device: deleting local directory {}",
-                            full.display()
-                        );
-                    }
-                    fs::remove_dir(&full).map_err(micropython::MicroPythonError::Io)?;
-                    actions.push(SyncAction {
-                        op: "delete_local_dir".to_string(),
-                        local: Some(full.display().to_string()),
-                        remote: None,
-                        dry_run: false,
-                    });
-                } else {
-                    if verbose && !json {
-                        println!("sync-from-device: deleting local file {}", full.display());
-                    }
-                    fs::remove_file(&full).map_err(micropython::MicroPythonError::Io)?;
-                    actions.push(SyncAction {
-                        op: "delete_local_file".to_string(),
-                        local: Some(full.display().to_string()),
-                        remote: None,
-                        dry_run: false,
-                    });
-                }
-            }
-        }
-
-        // Ensure base directory exists.
-        fs::create_dir_all(&local_root).map_err(micropython::MicroPythonError::Io)?;
-
-        // Download/update only files that differ.
-        let mut ordered = remote_entries;
-        ordered.sort_by_key(|(rel, _)| rel.matches('/').count());
-
-        for (rel, info) in ordered {
-            let rel_pathbuf = PathBuf::from(&rel);
-            if path_is_ignored(&rel_pathbuf, &ignore_patterns_clone) {
-                if verbose && !json {
-                    println!("sync-from-device: ignoring {} due to ignore patterns", rel);
-                }
-                actions.push(SyncAction {
-                    op: "ignore".to_string(),
-                    local: Some(local_root.join(&rel).display().to_string()),
-                    remote: Some(join_remote_path(remote, &rel)),
-                    dry_run: false,
-                });
-                continue;
-            }
-
-            let local_path = local_root.join(&rel);
-            if info.is_dir {
-                if verbose && !json {
-                    println!(
-                        "sync-from-device: ensuring directory {}",
-                        local_path.display()
-                    );
-                }
-                fs::create_dir_all(&local_path).map_err(micropython::MicroPythonError::Io)?;
-                actions.push(SyncAction {
-                    op: "ensure_dir".to_string(),
-                    local: Some(local_path.display().to_string()),
-                    remote: Some(join_remote_path(remote, &rel)),
-                    dry_run: false,
-                });
-            } else {
-                let maybe_local_info = local_files.get(&rel);
-
-                // Detect "both changed" conflicts based on last sync time, if
-                // we have one and both sides report modification times.
-                if let (Some(t0), Some(local_info)) = (last_sync_time, maybe_local_info)
-                    && let (Some(lm), Some(rm)) = (local_info.modified, info.modified)
-                        && lm > t0 && rm > t0 && lm != rm {
-                            if !json {
-                                eprintln!(
-                                    "sync-from-device: WARNING: both local and remote changed since last sync for {}",
-                                    local_path.display()
-                                );
-                            }
-                            actions.push(SyncAction {
-                                op: "conflict".to_string(),
-                                local: Some(local_path.display().to_string()),
-                                remote: Some(join_remote_path(remote, &rel)),
-                                dry_run,
-                            });
-                        }
-
-                let needs_download = match maybe_local_info {
-                    None => true,
-                    Some(local_info) => {
-                        if local_info.is_dir {
-                            true
-                        } else {
-                            !matches!(
-                                (local_info.modified, info.modified),
-                                (Some(lm), Some(rm))
-                                    if lm == rm && local_info.size == info.size
-                            )
-                        }
-                    }
-                };
-
-                if needs_download {
-                    let remote_path = join_remote_path(remote, &rel);
-                    if verbose && !json {
-                        println!(
-                            "sync-from-device: downloading {} -> {}",
-                            remote_path,
-                            local_path.display()
-                        );
-                    }
-                    let data = dev.read_file(&remote_path)?;
-                    if let Some(parent) = local_path.parent() {
-                        fs::create_dir_all(parent).map_err(micropython::MicroPythonError::Io)?;
-                    }
-                    fs::write(&local_path, data).map_err(micropython::MicroPythonError::Io)?;
-                    actions.push(SyncAction {
-                        op: "download".to_string(),
-                        local: Some(local_path.display().to_string()),
-                        remote: Some(remote_path),
-                        dry_run: false,
-                    });
-                } else {
-                    if verbose && !json {
-                        println!(
-                            "sync-from-device: skipping unchanged {}",
-                            local_path.display()
-                        );
-                    }
-                    actions.push(SyncAction {
-                        op: "skip_download".to_string(),
-                        local: Some(local_path.display().to_string()),
-                        remote: Some(join_remote_path(remote, &rel)),
-                        dry_run: false,
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    })?;
-
-    if json {
-        let summary = serde_json::json!({
-            "direction": "from_device",
-            "local_root": local_root.display().to_string(),
-            "remote_root": remote,
-            "actions": actions,
-        });
-        println!("{}", serde_json::to_string_pretty(&summary)?);
-    }
-
-    Ok(())
-}
-
-fn rel_path_to_remote(rel: &Path) -> String {
-    let mut parts = Vec::new();
-    for comp in rel.components() {
-        parts.push(comp.as_os_str().to_string_lossy().into_owned());
-    }
-    parts.join("/")
-}
-
 fn format_mtime(epoch: u64) -> String {
     match Utc.timestamp_opt(epoch as i64, 0).single() {
         Some(dt) => dt.to_rfc3339(),
@@ -1355,113 +1135,12 @@ fn ls_recursive_entries_to_json(root: &str, entries: &[(String, RemoteInfo)]) ->
     serde_json::Value::Array(arr)
 }
 
-fn system_time_to_unix(t: std::time::SystemTime) -> Option<u64> {
-    match t.duration_since(std::time::UNIX_EPOCH) {
-        Ok(dur) => Some(dur.as_secs()),
-        Err(_) => None,
-    }
-}
-
-fn collect_local_entries(
-    root: &Path,
-    rel: &Path,
-    out: &mut Vec<(PathBuf, bool)>,
-) -> io::Result<()> {
-    let dir = if rel.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let name = entry.file_name();
-        let child_rel = if rel.as_os_str().is_empty() {
-            PathBuf::from(&name)
-        } else {
-            rel.join(&name)
-        };
-
-        if file_type.is_dir() {
-            out.push((child_rel.clone(), true));
-            collect_local_entries(root, &child_rel, out)?;
-        } else if file_type.is_file() {
-            out.push((child_rel, false));
-        }
-    }
-
-    Ok(())
-}
-
-fn build_ignore_patterns(root: &Path, extra: &[String]) -> io::Result<Vec<String>> {
-    let mut patterns: Vec<String> = vec![
-        ".git".into(),
-        "__pycache__".into(),
-        ".venv".into(),
-        "target".into(),
-    ];
-
-    patterns.extend(extra.iter().cloned());
-
-    let ignore_path = root.join(".rupicoignore");
-    if let Ok(contents) = fs::read_to_string(&ignore_path) {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            patterns.push(line.to_string());
-        }
-    }
-
-    Ok(patterns)
-}
-
-fn path_is_ignored(rel: &Path, patterns: &[String]) -> bool {
-    let rel_str = rel_path_to_remote(rel);
-    patterns.iter().any(|pat| rel_str.contains(pat))
-}
-
-#[derive(Debug, Clone)]
-struct LocalInfo {
-    is_dir: bool,
-    size: u64,
-    modified: Option<u64>,
-}
-
+/// Remote entry metadata used by `ls -R` (mtime-based display only).
 #[derive(Debug, Clone)]
 struct RemoteInfo {
     is_dir: bool,
     size: u64,
     modified: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SyncAction {
-    op: String,
-    local: Option<String>,
-    remote: Option<String>,
-    dry_run: bool,
-}
-
-/// Workspace-level configuration loaded from `.rupico.toml` in the project
-/// root (or one of its parent directories).
-#[derive(Debug, Clone, Deserialize)]
-struct WorkspaceConfig {
-    /// Local root directory for project files, relative to the workspace
-    /// root (where `.rupico.toml` lives).
-    local_root: String,
-    /// Remote root directory on the device, e.g. `/app`.
-    remote_root: String,
-}
-
-/// Mutable workspace state stored alongside the config, used for tracking
-/// last sync times so we can detect "both changed" conflicts.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct WorkspaceState {
-    last_sync_to_device: Option<u64>,
-    last_sync_from_device: Option<u64>,
 }
 
 fn collect_remote_entries(
@@ -1495,39 +1174,6 @@ fn collect_remote_entries(
     }
 
     Ok(())
-}
-
-/// Locate and load `.rupico.toml`, walking up from the current directory
-/// towards the filesystem root. Returns the workspace root directory and the
-/// parsed configuration.
-fn find_workspace_config() -> Result<(PathBuf, WorkspaceConfig), Box<dyn Error>> {
-    let mut dir = std::env::current_dir()?;
-    loop {
-        let candidate = dir.join(".rupico.toml");
-        if candidate.is_file() {
-            let text = fs::read_to_string(&candidate)?;
-            let cfg: WorkspaceConfig = toml::from_str(&text)?;
-            return Ok((dir, cfg));
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    Err("no .rupico.toml found in current or parent directories".into())
-}
-
-fn load_workspace_state(root: &Path) -> WorkspaceState {
-    let path = root.join(".rupico-state.json");
-    match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => WorkspaceState::default(),
-    }
-}
-
-fn save_workspace_state(root: &Path, state: &WorkspaceState) -> io::Result<()> {
-    let path = root.join(".rupico-state.json");
-    let json = serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".to_string());
-    fs::write(path, json)
 }
 
 const BLINK_TEMPLATE_BLINK_PY: &str = r#"from machine import Pin
