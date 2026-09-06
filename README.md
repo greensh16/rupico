@@ -49,6 +49,11 @@ Prebuilt binaries for macOS (Intel and Apple silicon), Linux and Windows are
 attached to each [release](https://github.com/greensh16/rupico/releases).
 Download, unpack, and put `rupico` on your `PATH`.
 
+The desktop app ships as `rupico.app` on macOS (drag it to `/Applications`) and
+as `rupico_gui` plus a `.desktop` entry on Linux. On macOS the app is ad-hoc
+signed but not notarised, so the first launch needs right-click → **Open** —
+see [The GUI](https://github.com/greensh16/rupico/wiki/The-GUI).
+
 Or install the CLI from crates.io:
 
 ```bash
@@ -184,6 +189,10 @@ snippets can only be verified against real hardware.
 The CLI is the supported interface and the right tool for bulk transfers. The
 GUI is usable but still experimental — its device I/O runs on the UI thread, so
 the window briefly freezes during long operations.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

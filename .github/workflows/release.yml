@@ -100,8 +100,60 @@ jobs:
           fi
           echo "rupico is ${ACTUAL}, as expected."
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      # macOS ships the GUI as an .app bundle. A bare Unix executable
+      # double-clicked in Finder is launched through Terminal, which puts a
+      # terminal window in front of the app.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="rupico-${VERSION}-${{ matrix.target }}"
+          APP="dist/${STAGE}/rupico.app"
+          mkdir -p "${APP}/Contents/MacOS"
+
+          cp "target/${{ matrix.target }}/release/rupico" "dist/${STAGE}/"
+          cp "target/${{ matrix.target }}/release/rupico_gui" "${APP}/Contents/MacOS/rupico_gui"
+          cp README.md LICENSE "dist/${STAGE}/"
+
+          # Strip before signing: stripping afterwards invalidates the
+          # signature.
+          strip "dist/${STAGE}/rupico" "${APP}/Contents/MacOS/rupico_gui" || true
+
+          cat > "${APP}/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>rupico</string>
+            <key>CFBundleDisplayName</key><string>rupico</string>
+            <key>CFBundleIdentifier</key><string>io.github.greensh16.rupico</string>
+            <key>CFBundleExecutable</key><string>rupico_gui</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # The heredoc above is indented for readability; strip that indent.
+          sed -i '' 's/^          //' "${APP}/Contents/Info.plist"
+          plutil -lint "${APP}/Contents/Info.plist"
+
+          # Apple silicon refuses to run unsigned binaries at all. This ad-hoc
+          # signature satisfies that; it is not Gatekeeper notarisation, so a
+          # downloaded app still needs right-click -> Open the first time.
+          codesign --force --sign - --timestamp=none "${APP}"
+          codesign --verify --deep "${APP}"
+
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          echo "ASSET=dist/${STAGE}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -112,6 +164,22 @@ jobs:
           cp "target/${{ matrix.target }}/release/rupico_gui" "dist/${STAGE}/"
           cp README.md LICENSE "dist/${STAGE}/"
           strip "dist/${STAGE}/rupico" "dist/${STAGE}/rupico_gui" || true
+
+          # Lets desktop environments show the GUI in their app menus once the
+          # binary is on PATH and this file is in ~/.local/share/applications.
+          cat > "dist/${STAGE}/rupico.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=rupico
+          GenericName=MicroPython IDE
+          Comment=Edit, run and sync code on MicroPython boards
+          Exec=rupico_gui
+          Terminal=false
+          Categories=Development;IDE;
+          Keywords=micropython;pico;embedded;serial;
+          DESKTOP
+          sed -i 's/^          //' "dist/${STAGE}/rupico.desktop"
+
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           echo "ASSET=dist/${STAGE}.tar.gz" >> "$GITHUB_ENV"
 

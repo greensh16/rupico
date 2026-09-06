@@ -1,3 +1,8 @@
+// On Windows, a console-subsystem binary opens a console window alongside the
+// GUI. Detach it for real builds, but keep it in debug builds so panics and
+// backtraces remain visible while developing.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Desktop UI for `rupico`.
 //!
 //! The layout is IDE-shaped: a slim toolbar carries the connection and run
