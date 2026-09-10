@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -35,6 +37,21 @@ pub struct SyncOptions {
     /// Overwrite files that changed on both sides since the last sync.
     /// Without it such files are skipped and reported as conflicts.
     pub force: bool,
+    /// Set from another thread to stop at the next file boundary.
+    ///
+    /// A cancelled sync is stopped, not undone: whatever was copied stays
+    /// copied, and the outcome says how far it got. The manifest it returns
+    /// is therefore partial — a caller that records baselines must not save
+    /// it (see [`SyncOutcome::cancelled`]).
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl SyncOptions {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
 }
 
 /// One decision the engine made, in the order it was made.
@@ -77,6 +94,9 @@ pub struct SyncOutcome {
     pub manifest: HashMap<String, String>,
     /// Files that changed on both sides and were left untouched.
     pub conflicts: usize,
+    /// The sync stopped early because it was cancelled. `manifest` covers
+    /// only what it managed to do, so it must not be saved as a baseline.
+    pub cancelled: bool,
 }
 
 impl SyncOutcome {
@@ -350,7 +370,20 @@ struct LocalInfo {
     is_dir: bool,
     size: u64,
     hash: Option<String>,
+    /// The bytes this entry was hashed from, kept for the upload that usually
+    /// follows so the file is read once instead of twice. `None` once taken,
+    /// or when the file did not fit the cache budget.
+    data: Option<Vec<u8>>,
 }
+
+/// Largest single file whose bytes are worth keeping between hashing and
+/// upload, and the ceiling across all of them.
+///
+/// A project that fits on a board is far below both; the caps exist so a
+/// stray large file in the synced folder cannot turn a sync into a
+/// memory-hungry one. Anything above them is simply read again.
+const MAX_CACHED_FILE: usize = 4 * 1024 * 1024;
+const LOCAL_CACHE_BUDGET: usize = 16 * 1024 * 1024;
 
 /// Metadata for a device-side entry.
 #[derive(Debug, Clone)]
@@ -430,6 +463,7 @@ type LocalIndex = (Vec<(PathBuf, bool)>, HashMap<String, LocalInfo>);
 fn index_local(
     root: &Path,
     patterns: &[String],
+    keep_bytes: bool,
     warn: &mut dyn FnMut(String),
 ) -> micropython::Result<LocalIndex> {
     let mut entries = Vec::<(PathBuf, bool)>::new();
@@ -440,6 +474,7 @@ fn index_local(
     entries.retain(|(rel, _)| !path_is_ignored(rel, patterns));
 
     let mut files = HashMap::new();
+    let mut budget = LOCAL_CACHE_BUDGET;
     for (rel, is_dir) in &entries {
         let key = rel_path_to_remote(rel);
         if *is_dir {
@@ -449,16 +484,26 @@ fn index_local(
                     is_dir: true,
                     size: 0,
                     hash: None,
+                    data: None,
                 },
             );
         } else {
             let data = fs::read(root.join(rel)).map_err(micropython::MicroPythonError::Io)?;
+            let hash = sha256_hex(&data);
+            let size = data.len() as u64;
+            let cached = if keep_bytes && data.len() <= MAX_CACHED_FILE && data.len() <= budget {
+                budget -= data.len();
+                Some(data)
+            } else {
+                None
+            };
             files.insert(
                 key,
                 LocalInfo {
                     is_dir: false,
-                    size: data.len() as u64,
-                    hash: Some(sha256_hex(&data)),
+                    size,
+                    hash: Some(hash),
+                    data: cached,
                 },
             );
         }
@@ -517,7 +562,8 @@ pub fn to_device(
 
     let patterns = build_ignore_patterns(local_root, &opts.ignore);
     let mut warnings = Vec::new();
-    let (entries, local_files) = index_local(local_root, &patterns, &mut |w| warnings.push(w))?;
+    let (entries, mut local_files) =
+        index_local(local_root, &patterns, true, &mut |w| warnings.push(w))?;
     for w in warnings {
         emit(
             &mut outcome,
@@ -577,6 +623,12 @@ pub fn to_device(
         to_delete.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.matches('/').count()));
 
         for (rel, is_dir) in to_delete {
+            // Cancellation stops at a file boundary: a transfer already in
+            // flight finishes rather than leaving a half-written file.
+            if opts.cancelled() {
+                outcome.cancelled = true;
+                break;
+            }
             let full = micropython::join_remote_path(remote_root, &rel);
             let op = if is_dir {
                 "delete_remote_dir"
@@ -620,6 +672,10 @@ pub fn to_device(
     let mut conflicted: Vec<(String, String)> = Vec::new();
 
     for (rel, is_dir) in &entries {
+        if opts.cancelled() {
+            outcome.cancelled = true;
+            break;
+        }
         let key = rel_path_to_remote(rel);
         let remote_path = micropython::join_remote_path(remote_root, &key);
         let local_path = local_root.join(rel);
@@ -631,8 +687,10 @@ pub fn to_device(
             continue;
         }
 
-        let local_info = match local_files.get(&key) {
-            Some(i) => i,
+        // Copied out rather than borrowed, so the cached bytes can be taken
+        // from the same map below.
+        let (local_size, local_hash) = match local_files.get(&key) {
+            Some(i) => (i.size, i.hash.clone()),
             None => continue,
         };
         let remote_info = remote_map.get(&key);
@@ -641,7 +699,7 @@ pub fn to_device(
         if let Some(baseline) = baseline
             && let Some(h0) = baseline.get(&key)
             && let Some(info) = remote_info
-            && let (Some(lh), Some(rh)) = (local_info.hash.as_ref(), info.hash.as_ref())
+            && let (Some(lh), Some(rh)) = (local_hash.as_ref(), info.hash.as_ref())
             && lh != h0
             && rh != h0
             && lh != rh
@@ -662,14 +720,20 @@ pub fn to_device(
         }
 
         let should_upload = needs_copy(
-            local_info.size,
-            local_info.hash.as_deref(),
+            local_size,
+            local_hash.as_deref(),
             remote_info.map(|i| (i.is_dir, i.size, i.hash.as_deref())),
         );
 
         if should_upload {
             if !opts.dry_run {
-                let data = fs::read(&local_path).map_err(micropython::MicroPythonError::Io)?;
+                // Indexing already read this file to hash it. Reuse those
+                // bytes rather than reading every synced file twice; only a
+                // file too big for the cache is read again.
+                let data = match local_files.get_mut(&key).and_then(|i| i.data.take()) {
+                    Some(cached) => cached,
+                    None => fs::read(&local_path).map_err(micropython::MicroPythonError::Io)?,
+                };
                 dev.write_file(&remote_path, &data)?;
             }
             emit(
@@ -757,7 +821,7 @@ pub fn from_device(
 
     let mut warnings = Vec::new();
     let (local_entries, local_files) =
-        index_local(local_root, &patterns, &mut |w| warnings.push(w))?;
+        index_local(local_root, &patterns, false, &mut |w| warnings.push(w))?;
     for w in warnings {
         emit(
             &mut outcome,
@@ -786,6 +850,12 @@ pub fn from_device(
         to_delete.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
 
         for (rel, is_dir) in to_delete {
+            // Cancellation stops at a file boundary: a transfer already in
+            // flight finishes rather than leaving a half-written file.
+            if opts.cancelled() {
+                outcome.cancelled = true;
+                break;
+            }
             let full = local_root.join(&rel);
             let op = if is_dir {
                 "delete_local_dir"
@@ -836,6 +906,10 @@ pub fn from_device(
     let mut conflicted: Vec<(String, String)> = Vec::new();
 
     for (rel, info) in ordered {
+        if opts.cancelled() {
+            outcome.cancelled = true;
+            break;
+        }
         let local_path = local_root.join(&rel);
         let remote_path = micropython::join_remote_path(remote_root, &rel);
 
@@ -923,6 +997,76 @@ pub fn from_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch directory that cleans up after itself.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rupico-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn indexing_for_upload_keeps_the_bytes_it_hashed() {
+        // Sync used to read every local file twice: once to hash it, once to
+        // upload it. The hashing pass now carries the bytes forward.
+        let tmp = TempDir::new("index-keep");
+        fs::write(tmp.0.join("main.py"), b"print('hi')\n").expect("write");
+        fs::create_dir(tmp.0.join("lib")).expect("mkdir");
+        fs::write(tmp.0.join("lib/mod.py"), b"X = 1\n").expect("write");
+
+        let (_, files) = index_local(&tmp.0, &[], true, &mut |w| {
+            panic!("unexpected warning: {w}")
+        })
+        .expect("index succeeds");
+
+        let main = files.get("main.py").expect("main.py indexed");
+        assert_eq!(main.data.as_deref(), Some(&b"print('hi')\n"[..]));
+        assert_eq!(
+            main.hash.as_deref(),
+            Some(sha256_hex(b"print('hi')\n").as_str())
+        );
+        assert_eq!(main.size, 12);
+        assert!(
+            files.get("lib").expect("lib indexed").data.is_none(),
+            "a directory has no bytes"
+        );
+    }
+
+    #[test]
+    fn indexing_for_download_keeps_no_bytes() {
+        // The other direction never uploads these files, so holding their
+        // contents would be memory spent for nothing.
+        let tmp = TempDir::new("index-drop");
+        fs::write(tmp.0.join("main.py"), b"print('hi')\n").expect("write");
+
+        let (_, files) = index_local(&tmp.0, &[], false, &mut |w| {
+            panic!("unexpected warning: {w}")
+        })
+        .expect("index succeeds");
+
+        let main = files.get("main.py").expect("main.py indexed");
+        assert!(main.data.is_none());
+        assert_eq!(
+            main.hash.as_deref(),
+            Some(sha256_hex(b"print('hi')\n").as_str()),
+            "the hash is still computed"
+        );
+    }
 
     #[test]
     fn needs_copy_when_destination_missing() {

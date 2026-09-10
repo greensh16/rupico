@@ -64,6 +64,63 @@ pub struct RemoteTreeEntry {
     pub size: u64,
     #[serde(rename = "h")]
     pub hash: Option<String>,
+    /// Device mtime, only when [`TreeOptions::mtimes`] asked for it. The
+    /// board usually has no clock, so this is for display, never for diffing.
+    #[serde(rename = "m", default)]
+    pub modified: Option<u64>,
+}
+
+/// What a tree walk should collect beyond names, types and sizes.
+///
+/// Both extras cost something on the device — hashes read every file, mtimes
+/// widen the JSON that a board with ~192 KB of RAM has to build — so each
+/// caller asks for only what it will use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeOptions {
+    /// sha256 of every file, for content-based diffing.
+    pub hashes: bool,
+    /// Modification times, where the filesystem reports them.
+    pub mtimes: bool,
+}
+
+impl TreeOptions {
+    /// Names, types and sizes only: no file is read, nothing is hashed.
+    pub fn metadata_only() -> Self {
+        Self::default()
+    }
+
+    /// What sync needs: a content hash per file.
+    pub fn hashed() -> Self {
+        Self {
+            hashes: true,
+            mtimes: false,
+        }
+    }
+}
+
+/// A writer that can interrupt the device from another thread.
+///
+/// Obtained from [`MicroPythonDevice::interrupt_handle`]. The interrupted
+/// exec returns normally on the owning thread, with `KeyboardInterrupt` in
+/// its stderr — the connection stays in raw REPL and usable.
+pub struct InterruptHandle {
+    port: Box<dyn SerialPort>,
+}
+
+impl InterruptHandle {
+    /// Send Ctrl-C to whatever is running on the device.
+    pub fn interrupt(&mut self) -> Result<()> {
+        self.port.write_all(&[CTRL_C])?;
+        self.port.flush()?;
+        Ok(())
+    }
+}
+
+/// What a recursive delete removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    pub files: usize,
+    pub dirs: usize,
 }
 
 /// Result of executing code in raw REPL mode.
@@ -94,6 +151,39 @@ pub struct MicroPythonDevice {
     /// - `Some(false)` means the device does not support raw-paste and we
     ///   should always fall back to classic raw-REPL execution.
     raw_paste_supported: Option<bool>,
+    /// Device-side stderr from helper snippets that did not look like a
+    /// raised exception. Kept rather than dropped so a front end can show
+    /// the board's own warnings; see `take_remote_warnings`.
+    remote_warnings: Vec<String>,
+}
+
+/// How many non-fatal device warnings to keep before dropping the oldest.
+/// A board printing on every helper call must not grow this without bound.
+const MAX_REMOTE_WARNINGS: usize = 16;
+
+/// Does device-side stderr describe a raised exception, or is it just
+/// something the board printed?
+///
+/// Raw REPL puts *everything* a snippet sends to stderr into the same frame,
+/// so treating any stderr at all as failure turned a board that warns during
+/// `os.listdir` into a failed `ls`. MicroPython prints a traceback for every
+/// uncaught exception, and that — plus a bare `SomeError:` line for the
+/// firmware that prints one without a traceback — is the signal to key on.
+fn stderr_is_fatal(stderr: &str) -> bool {
+    if stderr.contains("Traceback (most recent call last)") {
+        return true;
+    }
+    stderr.lines().any(|line| {
+        let line = line.trim();
+        let Some((head, _)) = line.split_once(':') else {
+            return line == "KeyboardInterrupt";
+        };
+        !head.is_empty()
+            && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && (head.ends_with("Error")
+                || head.ends_with("Exception")
+                || head == "KeyboardInterrupt")
+    })
 }
 
 impl MicroPythonDevice {
@@ -113,6 +203,71 @@ impl MicroPythonDevice {
         }
         out
     }
+
+    /// Wrap a helper program so it leaves nothing in the user's namespace.
+    ///
+    /// Raw REPL execs at module level, so every temporary a helper binds —
+    /// `p`, `f`, `src`, even the modules it imports — lands in the same
+    /// `__main__` that the user's script and the REPL prompt then see. A
+    /// script whose own first line is `src = open(...)` would find someone
+    /// else's `src` already there, left by whatever rupico did last.
+    ///
+    /// Running the body inside a function makes all of it function-local. The
+    /// one name that remains is deleted whether the body raised or not.
+    fn scoped(body: &str) -> String {
+        let mut out = String::with_capacity(body.len() + 96);
+        out.push_str("def _rupico_op():\n");
+        for line in body.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str("try:\n    _rupico_op()\nfinally:\n    del _rupico_op\n");
+        out
+    }
+
+    /// Run one filesystem helper program and take its stdout.
+    ///
+    /// Every helper goes through here, so scoping and the "did the device
+    /// actually raise?" question are each decided in exactly one place. User
+    /// code does *not*: `run_file` and the REPL must execute at module level,
+    /// where the names a script defines are supposed to stick.
+    fn run_helper(&mut self, body: String) -> Result<String> {
+        let result = self.exec_raw_classic(Self::scoped(&body))?;
+        self.check_remote(result)
+    }
+
+    /// Unwrap a helper snippet's result: stdout on success, `Remote` only if
+    /// the device actually raised.
+    ///
+    /// Anything else the board printed to stderr is a warning, and is kept
+    /// for `take_remote_warnings` rather than failing the operation.
+    fn check_remote(&mut self, result: ExecResult) -> Result<String> {
+        if stderr_is_fatal(&result.stderr) {
+            return Err(MicroPythonError::Remote(result.stderr));
+        }
+        if !result.stderr.trim().is_empty() {
+            if self.remote_warnings.len() == MAX_REMOTE_WARNINGS {
+                self.remote_warnings.remove(0);
+            }
+            self.remote_warnings
+                .push(result.stderr.trim_end().to_string());
+        }
+        Ok(result.stdout)
+    }
+
+    /// Take everything the device has printed to stderr without raising.
+    ///
+    /// Draining rather than copying, so a caller that polls this between
+    /// operations reports each warning once.
+    pub fn take_remote_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.remote_warnings)
+    }
+
     /// Open a serial port and construct a `MicroPythonDevice` with explicit
     /// baud rate and read timeout.
     pub fn open(path: &str, baud_rate: u32, read_timeout: Duration) -> Result<Self> {
@@ -127,6 +282,7 @@ impl MicroPythonDevice {
             read_timeout: Some(read_timeout),
             rx_buf: Vec::new(),
             raw_paste_supported: None,
+            remote_warnings: Vec::new(),
         })
     }
 
@@ -143,6 +299,7 @@ impl MicroPythonDevice {
             read_timeout: Some(read_timeout),
             rx_buf: Vec::new(),
             raw_paste_supported: None,
+            remote_warnings: Vec::new(),
         }
     }
 
@@ -160,6 +317,19 @@ impl MicroPythonDevice {
         const DEFAULT_BAUD: u32 = 115_200;
         const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(3);
         Self::open(path, DEFAULT_BAUD, DEFAULT_READ_TIMEOUT)
+    }
+
+    /// A second handle on this port, for interrupting from another thread.
+    ///
+    /// Raw REPL has no out-of-band channel: stopping a running program means
+    /// writing Ctrl-C to the port, and the thread that owns the device is
+    /// precisely the one blocked waiting for that program's output. This
+    /// hands a *writer* to another thread so a UI can stay responsive; it
+    /// deliberately exposes nothing but the interrupt.
+    pub fn interrupt_handle(&self) -> Result<InterruptHandle> {
+        Ok(InterruptHandle {
+            port: self.port.try_clone()?,
+        })
     }
 
     /// Send Ctrl-C to interrupt any running program.
@@ -277,18 +447,76 @@ impl MicroPythonDevice {
         self.exec_raw(code)
     }
 
+    /// Run one entry typed at an interactive prompt.
+    ///
+    /// Raw REPL compiles whatever it is sent in `exec` mode, so a bare
+    /// expression runs but its value is thrown away: `run_snippet("1 + 1")`
+    /// prints nothing, which is not what someone typing at a prompt expects.
+    /// Compiling in `single` mode instead is what makes a prompt a prompt —
+    /// the device echoes the value of each expression statement and stays
+    /// quiet for assignments and for `None`, which is the result of most calls
+    /// worth making on a board.
+    ///
+    /// Names bind in the device's `__main__` globals, so state carries across
+    /// calls for as long as the raw-REPL session lives. The wrapper's own
+    /// temporaries are `_rupico_`-prefixed because they are visible to a
+    /// `dir()` typed at the prompt, so they should at least be obviously ours.
+    pub fn run_repl_entry(&mut self, source: &str) -> Result<ExecResult> {
+        self.exec_raw(Self::repl_snippet(source))
+    }
+
+    /// Build the device-side program for one REPL entry.
+    ///
+    /// Split out from `run_repl_entry` so the escaping — the part that breaks
+    /// badly on a quote or a newline — can be tested without a board.
+    fn repl_snippet(source: &str) -> String {
+        let escaped = Self::py_escape_single_quoted(source);
+        format!(
+            concat!(
+                "_rupico_src = '{}'\n",
+                "try:\n",
+                "    _rupico_code = compile(_rupico_src, '<repl>', 'single')\n",
+                // Deliberately broad. A build without `compile`, or without
+                // `single` mode, must degrade to a plain exec rather than
+                // fail the entry — and a genuine syntax error in the entry is
+                // not swallowed, because the fallback re-raises it.
+                "except:\n",
+                "    _rupico_code = None\n",
+                "if _rupico_code is None:\n",
+                "    exec(_rupico_src)\n",
+                "else:\n",
+                "    exec(_rupico_code)\n",
+            ),
+            escaped,
+        )
+    }
+
     /// Execute a Python file already stored on the device.
     ///
     /// This uses `exec` on the contents of the file. It assumes raw
     /// REPL mode is active.
+    ///
+    /// The reader's temporaries are `_rupico_`-prefixed and deleted before
+    /// the script runs: they share the namespace the script then executes in,
+    /// so plain names like `p`, `f` or `src` would shadow the script's own —
+    /// a script whose first line is `src = open(...)` should not find someone
+    /// else's `src` already bound.
     pub fn run_file(&mut self, path: &str) -> Result<ExecResult> {
         let escaped = Self::py_escape_single_quoted(path);
         let code = format!(
             concat!(
-                "p = '{}'\n",
-                "with open(p, 'r') as f:\n",
-                "    src = f.read()\n",
-                "exec(src)\n",
+                "_rupico_f = open('{}', 'r')\n",
+                "try:\n",
+                "    _rupico_src = _rupico_f.read()\n",
+                "finally:\n",
+                "    _rupico_f.close()\n",
+                "    del _rupico_f\n",
+                // `finally`, so a script that raises still leaves nothing of
+                // ours behind for the next run to trip over.
+                "try:\n",
+                "    exec(_rupico_src)\n",
+                "finally:\n",
+                "    del _rupico_src\n",
             ),
             escaped,
         );
@@ -335,12 +563,9 @@ impl MicroPythonDevice {
             escaped
         );
 
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        let stdout = self.run_helper(code)?;
 
-        let trimmed = result.stdout.trim();
+        let trimmed = stdout.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
@@ -348,7 +573,7 @@ impl MicroPythonDevice {
         let entries: Vec<RemoteEntry> = serde_json::from_str(trimmed).map_err(|e| {
             MicroPythonError::Protocol(format!(
                 "invalid JSON from device while listing '{}': {e}; stdout={}",
-                path, result.stdout
+                path, stdout
             ))
         })?;
 
@@ -379,10 +604,30 @@ impl MicroPythonDevice {
     /// walk, but a failure never truncates the listing silently: every
     /// directory that can be listed is listed.
     pub fn list_tree_hashed(&mut self, root: &str) -> Result<Option<Vec<RemoteTreeEntry>>> {
+        self.list_tree(root, TreeOptions::hashed())
+    }
+
+    /// Recursively list a directory tree on the device in a single round trip,
+    /// collecting the extras named by `opts`.
+    ///
+    /// `list_tree_hashed` is this with hashing on. Hashing is what makes the
+    /// walk expensive — every file is read on the device — so a caller that
+    /// only wants to *show* a tree (`ls -R`, the GUI's file rail) should ask
+    /// for [`TreeOptions::metadata_only`] and get the same single round trip
+    /// for the cost of a `stat` per entry.
+    ///
+    /// The `None` return and the skip-don't-abort behaviour are exactly as
+    /// documented on [`Self::list_tree_hashed`].
+    pub fn list_tree(
+        &mut self,
+        root: &str,
+        opts: TreeOptions,
+    ) -> Result<Option<Vec<RemoteTreeEntry>>> {
         let escaped = Self::py_escape_single_quoted(root);
-        let code = format!(
+        // Turning hashing off is a matter of never finding a sha256: `fhash`
+        // then returns `None` for every file without opening it.
+        let sha_setup = if opts.hashes {
             concat!(
-                "import os, json, binascii\n",
                 "_sha = None\n",
                 "try:\n",
                 "    import hashlib\n",
@@ -395,7 +640,22 @@ impl MicroPythonDevice {
                 "        _sha = getattr(uhashlib, 'sha256', None)\n",
                 "    except ImportError:\n",
                 "        pass\n",
-                "root = '{}'\n",
+            )
+        } else {
+            "_sha = None\n"
+        };
+        // The key is left out entirely rather than sent as null: it is per
+        // entry, and the device has to hold the whole JSON in RAM.
+        let (mt_dir, mt_file) = if opts.mtimes {
+            (", m=None", ", m=(st[8] if len(st) > 8 else None)")
+        } else {
+            ("", "")
+        };
+        let code = format!(
+            concat!(
+                "import os, json, binascii\n",
+                "{sha_setup}",
+                "root = '{root}'\n",
                 "out = []\n",
                 "def fhash(p):\n",
                 "    if _sha is None:\n",
@@ -431,10 +691,10 @@ impl MicroPythonDevice {
                 "        except OSError:\n",
                 "            continue\n",
                 "        if st[0] & 0x4000:\n",
-                "            out.append(dict(p=r, d=True, s=0, h=None))\n",
+                "            out.append(dict(p=r, d=True, s=0, h=None{mt_dir}))\n",
                 "            walk(full, r)\n",
                 "        else:\n",
-                "            out.append(dict(p=r, d=False, s=st[6], h=fhash(full)))\n",
+                "            out.append(dict(p=r, d=False, s=st[6], h=fhash(full){mt_file}))\n",
                 // `null` marks a root that does not exist, so the host can
                 // tell "missing" apart from "empty".
                 "_missing = False\n",
@@ -448,15 +708,15 @@ impl MicroPythonDevice {
                 "    walk(root, '')\n",
                 "    print(json.dumps(out))\n",
             ),
-            escaped
+            sha_setup = sha_setup,
+            root = escaped,
+            mt_dir = mt_dir,
+            mt_file = mt_file,
         );
 
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        let stdout = self.run_helper(code)?;
 
-        let trimmed = result.stdout.trim();
+        let trimmed = stdout.trim();
         if trimmed.is_empty() {
             return Err(MicroPythonError::Protocol(format!(
                 "empty response from device while hashing tree '{root}'"
@@ -466,7 +726,7 @@ impl MicroPythonDevice {
         let entries: Option<Vec<RemoteTreeEntry>> = serde_json::from_str(trimmed).map_err(|e| {
             MicroPythonError::Protocol(format!(
                 "invalid JSON from device while hashing tree '{}': {e}; stdout={}",
-                root, result.stdout
+                root, stdout
             ))
         })?;
 
@@ -502,18 +762,11 @@ impl MicroPythonDevice {
             escaped, READ_CHUNK
         );
 
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        let stdout = self.run_helper(code)?;
 
         // `b2a_base64` terminates every chunk with a newline, so strip all
         // whitespace before decoding the concatenated stream.
-        let b64: String = result
-            .stdout
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let b64: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
         if b64.is_empty() {
             return Ok(Vec::new());
         }
@@ -521,7 +774,7 @@ impl MicroPythonDevice {
         let decoded = B64.decode(&b64).map_err(|e| {
             MicroPythonError::Protocol(format!(
                 "invalid base64 from device while reading '{}': {e}; stdout={}",
-                path, result.stdout
+                path, stdout
             ))
         })?;
 
@@ -594,20 +847,34 @@ impl MicroPythonDevice {
             ),
             from_escaped, to_escaped
         );
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        self.run_helper(code)?;
         Ok(())
+    }
+
+    /// True when a device-side traceback is an out-of-memory failure.
+    fn is_remote_memory_error(err: &MicroPythonError) -> bool {
+        matches!(err, MicroPythonError::Remote(msg) if msg.contains("MemoryError"))
     }
 
     /// Write bytes straight to `path`, truncating it on the first chunk.
     ///
     /// This is the raw transfer used by [`write_file`] to fill its staging
     /// file; callers that need overwrite safety should use `write_file`.
+    ///
+    /// A chunk costs the board about 4/3 its size as a base64 string literal
+    /// inside the snippet, plus the decoded bytes, and the literal is
+    /// allocated while the snippet is still being *compiled*. Entering the
+    /// raw REPL interrupts a running program but never frees what it
+    /// allocated, so a board that was mid-program has a heap that is both
+    /// smaller and more fragmented than an idle one, and that literal is the
+    /// allocation that fails. When it does, halve the chunk and start the
+    /// file over rather than surfacing a `MemoryError` the user cannot act
+    /// on. Restarting (instead of resuming) is deliberate: the first chunk
+    /// truncates, so a fresh pass cannot append onto a partial write.
     fn write_file_direct(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let escaped_path = Self::py_escape_single_quoted(path);
-        const CHUNK_SIZE: usize = 2048;
+        // Largest first; each retry is a full re-send, so keep the ladder short.
+        const CHUNK_SIZES: [usize; 4] = [2048, 1024, 512, 256];
 
         if data.is_empty() {
             // Ensure the file exists and is empty.
@@ -615,14 +882,35 @@ impl MicroPythonDevice {
                 concat!("p = '{}'\n", "with open(p, 'wb') as f:\n", "    pass\n",),
                 escaped_path
             );
-            let result = self.exec_raw_classic(code)?;
-            if !result.stderr.is_empty() {
-                return Err(MicroPythonError::Remote(result.stderr));
-            }
+            self.run_helper(code)?;
             return Ok(());
         }
 
-        for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+        let mut last_err: Option<MicroPythonError> = None;
+        for (attempt, &chunk_size) in CHUNK_SIZES.iter().enumerate() {
+            if attempt > 0 {
+                // The collect needs its own frame: a `gc.collect()` at the top
+                // of the failing snippet would never run, because compiling
+                // that snippet is what ran out of memory.
+                let _ = self.exec_raw_classic("import gc\ngc.collect()\n");
+            }
+
+            match self.write_chunks(&escaped_path, data, chunk_size) {
+                Ok(()) => return Ok(()),
+                Err(e) if Self::is_remote_memory_error(&e) => last_err = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            MicroPythonError::Protocol("write retry loop made no attempt".to_string())
+        }))
+    }
+
+    /// Send `data` to an already-escaped `path` as base64 chunks of
+    /// `chunk_size` bytes. The first chunk truncates the file.
+    fn write_chunks(&mut self, escaped_path: &str, data: &[u8], chunk_size: usize) -> Result<()> {
+        for (i, chunk) in data.chunks(chunk_size).enumerate() {
             let mode = if i == 0 { "wb" } else { "ab" };
             let b64 = B64.encode(chunk);
             let code = format!(
@@ -637,10 +925,7 @@ impl MicroPythonDevice {
                 escaped_path, b64, mode
             );
 
-            let result = self.exec_raw_classic(code)?;
-            if !result.stderr.is_empty() {
-                return Err(MicroPythonError::Remote(result.stderr));
-            }
+            self.run_helper(code)?;
         }
 
         Ok(())
@@ -652,17 +937,81 @@ impl MicroPythonDevice {
     }
 
     /// Remove a file on the device.
+    ///
+    /// Refuses a directory with a message that names the way out, rather than
+    /// letting `os.remove` fail with a bare errno the user has to decode.
     pub fn remove(&mut self, path: &str) -> Result<()> {
         let escaped = Self::py_escape_single_quoted(path);
         let code = format!(
-            concat!("import os\n", "p = '{}'\n", "os.remove(p)\n",),
+            concat!(
+                "import os\n",
+                "p = '{}'\n",
+                "if os.stat(p)[0] & 0x4000:\n",
+                "    raise OSError('is a directory, remove it recursively: ' + p)\n",
+                "os.remove(p)\n",
+            ),
             escaped
         );
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        self.run_helper(code)?;
         Ok(())
+    }
+
+    /// Remove a file, or a directory and everything inside it.
+    ///
+    /// One round trip: the walk, the unlinks and the rmdirs all happen on the
+    /// device. Directories are removed deepest-first, because a board's
+    /// `os.rmdir` only takes empty ones.
+    ///
+    /// The filesystem root is emptied but not itself removed — `rmdir('/')`
+    /// cannot succeed, and failing *after* deleting everything would be a
+    /// confusing way to report a job that was actually done.
+    pub fn remove_tree(&mut self, path: &str) -> Result<RemoveOutcome> {
+        let escaped = Self::py_escape_single_quoted(path);
+        let code = format!(
+            concat!(
+                "import os, json\n",
+                "root = '{}'\n",
+                "nf = 0\n",
+                "nd = 0\n",
+                // A missing path raises here, before anything is deleted.
+                "if os.stat(root)[0] & 0x4000:\n",
+                "    stack = [root]\n",
+                "    dirs = []\n",
+                "    while stack:\n",
+                "        d = stack.pop()\n",
+                "        dirs.append(d)\n",
+                "        for name in os.listdir(d):\n",
+                "            full = (d + name) if d.endswith('/') else (d + '/' + name)\n",
+                "            if os.stat(full)[0] & 0x4000:\n",
+                "                stack.append(full)\n",
+                "            else:\n",
+                "                os.remove(full)\n",
+                "                nf += 1\n",
+                // A parent is always appended before its children, so popping
+                // from the end always empties a directory before removing it.
+                "    while dirs:\n",
+                "        d = dirs.pop()\n",
+                "        if d != '/':\n",
+                "            os.rmdir(d)\n",
+                "            nd += 1\n",
+                "else:\n",
+                "    os.remove(root)\n",
+                "    nf += 1\n",
+                "print(json.dumps([nf, nd]))\n",
+            ),
+            escaped
+        );
+        let stdout = self.run_helper(code)?;
+
+        let counts: (usize, usize) = serde_json::from_str(stdout.trim()).map_err(|e| {
+            MicroPythonError::Protocol(format!(
+                "invalid JSON from device while removing '{path}': {e}; stdout={stdout}"
+            ))
+        })?;
+        Ok(RemoveOutcome {
+            files: counts.0,
+            dirs: counts.1,
+        })
     }
 
     /// Create a directory on the device.
@@ -672,10 +1021,7 @@ impl MicroPythonDevice {
             concat!("import os\n", "p = '{}'\n", "os.mkdir(p)\n",),
             escaped
         );
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        self.run_helper(code)?;
         Ok(())
     }
 
@@ -686,10 +1032,7 @@ impl MicroPythonDevice {
             concat!("import os\n", "p = '{}'\n", "os.rmdir(p)\n",),
             escaped
         );
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        self.run_helper(code)?;
         Ok(())
     }
 
@@ -706,10 +1049,7 @@ impl MicroPythonDevice {
             ),
             old_escaped, new_escaped
         );
-        let result = self.exec_raw_classic(code)?;
-        if !result.stderr.is_empty() {
-            return Err(MicroPythonError::Remote(result.stderr));
-        }
+        self.run_helper(code)?;
         Ok(())
     }
 
@@ -1063,6 +1403,22 @@ pub fn vid_looks_micropython(port_type: &serialport::SerialPortType) -> bool {
 ///
 /// Handles the root `/` special case so that `join_remote_path("/", "main.py")`
 /// produces `"/main.py"` rather than `"//main.py"`.
+/// The directory part of a tree-relative path, `""` for a top-level entry.
+///
+/// Tree walks report paths relative to their root (`lib/thing/mod.py`), and
+/// both front ends have to regroup those into directories to display them.
+pub fn remote_parent(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    }
+}
+
+/// The final component of a path.
+pub fn remote_leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 pub fn join_remote_path(base: &str, name: &str) -> String {
     if base == "/" {
         format!("/{}", name)
@@ -1359,6 +1715,205 @@ mod tests {
     use super::fake::{self, Paste};
 
     #[test]
+    fn removing_a_tree_reports_what_it_removed() {
+        let (mut dev, port) = fake::device(Some(Paste::Declined), vec![("[7, 2]\n", "")]);
+        let outcome = dev.remove_tree("/lib").expect("remove succeeds");
+        assert_eq!(
+            outcome,
+            RemoveOutcome { files: 7, dirs: 2 },
+            "the caller can say what was deleted"
+        );
+
+        let sent = port.written_text();
+        assert!(sent.contains("os.rmdir(d)"), "directories go too:\n{sent}");
+        assert!(
+            sent.contains("if d != '/':"),
+            "the filesystem root cannot be rmdir'd, so emptying it must not \
+             fail after the work is done:\n{sent}"
+        );
+    }
+
+    #[test]
+    fn removing_a_directory_without_recursion_says_so() {
+        // `os.remove` on a directory fails with a bare errno; the user needs
+        // to be told which flag fixes it.
+        let (mut dev, port) = fake::device(Some(Paste::Declined), vec![("", "")]);
+        dev.remove("/lib").expect("the fake device raises nothing");
+        assert!(
+            port.written_text()
+                .contains("is a directory, remove it recursively"),
+            "the refusal must name the way out"
+        );
+    }
+
+    #[test]
+    fn a_metadata_only_tree_walk_neither_hashes_nor_widens_the_payload() {
+        // `ls -R` used to cost a round trip per directory. It now shares
+        // sync's single-round-trip walk, but must not pay for sync's hashing
+        // (a full read of every file on the board) to do it.
+        let (mut dev, port) = fake::device(Some(Paste::Declined), vec![("[]", "")]);
+        dev.list_tree("/", TreeOptions::metadata_only())
+            .expect("walk succeeds");
+        let sent = port.written_text();
+        assert!(
+            !sent.contains("hashlib"),
+            "no hashing was asked for:\n{sent}"
+        );
+        assert!(
+            !sent.contains("m=None"),
+            "no mtimes were asked for:\n{sent}"
+        );
+
+        let (mut dev, port) = fake::device(Some(Paste::Declined), vec![("[]", "")]);
+        dev.list_tree(
+            "/",
+            TreeOptions {
+                hashes: false,
+                mtimes: true,
+            },
+        )
+        .expect("walk succeeds");
+        assert!(port.written_text().contains("m=(st[8]"));
+
+        let (mut dev, port) = fake::device(Some(Paste::Declined), vec![("[]", "")]);
+        dev.list_tree_hashed("/").expect("walk succeeds");
+        let sent = port.written_text();
+        assert!(sent.contains("uhashlib"), "sync still hashes:\n{sent}");
+        assert!(!sent.contains("m=None"), "sync never wants mtimes:\n{sent}");
+    }
+
+    #[test]
+    fn a_tree_entry_parses_with_and_without_an_mtime() {
+        let json = r#"[{"p":"a.py","d":false,"s":3,"h":null,"m":1733550000},
+                       {"p":"b.py","d":false,"s":3,"h":null}]"#;
+        let entries: Vec<RemoteTreeEntry> = serde_json::from_str(json).expect("JSON parse failed");
+        assert_eq!(entries[0].modified, Some(1_733_550_000));
+        assert_eq!(entries[1].modified, None);
+    }
+
+    #[test]
+    fn running_a_file_leaves_no_bindings_for_the_script_to_trip_over() {
+        // The defect: the reader bound `p`, `f` and `src` in the very
+        // namespace the script then ran in.
+        let (mut dev, port) = fake::device(Some(Paste::Supported), vec![("", "")]);
+        dev.run_file("/main.py").expect("exec succeeds");
+
+        let sent = port.written_text();
+        for leaked in ["\np = '", "\nf = ", "\nsrc = ", " as f:"] {
+            assert!(
+                !sent.contains(leaked),
+                "run_file must not bind {leaked:?}:\n{sent}"
+            );
+        }
+        assert!(
+            sent.contains("del _rupico_src"),
+            "temporaries are cleaned up"
+        );
+        assert!(sent.contains("_rupico_f.close()"), "the file is closed");
+    }
+
+    #[test]
+    fn device_stderr_is_only_fatal_when_it_is_a_raised_exception() {
+        assert!(stderr_is_fatal(
+            "Traceback (most recent call last):\n  File \"<stdin>\", line 1\nOSError: [Errno 2]"
+        ));
+        assert!(stderr_is_fatal("OSError: [Errno 2] ENOENT"));
+        assert!(stderr_is_fatal("KeyboardInterrupt"));
+        assert!(stderr_is_fatal("MemoryError: memory allocation failed"));
+
+        // A board that prints its own diagnostics is not a failure.
+        assert!(!stderr_is_fatal(""));
+        assert!(!stderr_is_fatal("\n  \n"));
+        assert!(!stderr_is_fatal("WARNING: low battery\n"));
+        assert!(!stderr_is_fatal("wifi: associated\n"));
+        assert!(!stderr_is_fatal("note: Error handling enabled\n"));
+    }
+
+    #[test]
+    fn a_device_warning_does_not_fail_a_listing() {
+        // The defect: any stderr at all failed the operation, so a board that
+        // logs during `os.listdir` could not be listed at all.
+        let (mut dev, _port) = fake::device(
+            Some(Paste::Declined),
+            vec![(
+                r#"[{"name":"main.py","is_dir":false,"size":12,"modified":null}]"#,
+                "wifi: reassociating\n",
+            )],
+        );
+        let entries = dev
+            .list_dir("/")
+            .expect("a warning must not fail the listing");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            dev.take_remote_warnings(),
+            vec!["wifi: reassociating".to_string()],
+            "the warning is kept for the caller to show"
+        );
+        assert!(
+            dev.take_remote_warnings().is_empty(),
+            "taking the warnings drains them"
+        );
+    }
+
+    #[test]
+    fn a_device_traceback_still_fails_the_listing() {
+        let (mut dev, _port) = fake::device(
+            Some(Paste::Declined),
+            vec![(
+                "",
+                "Traceback (most recent call last):\n  File \"<stdin>\", line 3\nOSError: [Errno 2] ENOENT\n",
+            )],
+        );
+        let err = dev
+            .list_dir("/nope")
+            .expect_err("a raise must fail the listing");
+        assert!(matches!(err, MicroPythonError::Remote(_)));
+    }
+
+    #[test]
+    fn a_repl_entry_compiles_interactively_and_can_fall_back() {
+        // A prompt that cannot echo `machine.freq()` is not a prompt, so the
+        // entry has to be compiled in `single` mode — but firmware without
+        // `compile` must still run it, via the plain-exec fallback.
+        let (mut dev, port) = fake::device(Some(Paste::Supported), vec![("42\n", "")]);
+        let res = dev.run_repl_entry("6 * 7").expect("exec succeeds");
+        assert_eq!(res.stdout, "42\n");
+
+        let sent = port.written_text();
+        assert!(
+            sent.contains("compile(_rupico_src, '<repl>', 'single')"),
+            "the entry must be compiled interactively:\n{sent}"
+        );
+        assert!(
+            sent.contains("exec(_rupico_src)"),
+            "a build without compile() must still run the entry:\n{sent}"
+        );
+    }
+
+    #[test]
+    fn a_repl_entry_survives_quotes_and_newlines() {
+        // The entry is spliced into a single-quoted Python literal, so an
+        // apostrophe or a multi-line block would otherwise end the string
+        // early and run something the user never typed.
+        let (mut dev, port) = fake::device(Some(Paste::Supported), vec![("", "")]);
+        dev.run_repl_entry("for i in range(2):\n    print('it\\'s fine')")
+            .expect("exec succeeds");
+
+        let sent = port.written_text();
+        // The handshake bytes share a line with the code, so match the
+        // assignment where it starts rather than at a line boundary.
+        let start = sent
+            .find("_rupico_src = ")
+            .expect("entry is sent as a literal");
+        let literal = sent[start..].lines().next().expect("literal is one line");
+        assert!(
+            literal.contains("\\n") && !literal.contains("print('it's"),
+            "quotes and newlines must stay escaped: {literal}"
+        );
+        assert!(literal.ends_with('\''), "the literal must close: {literal}");
+    }
+
+    #[test]
     fn raw_paste_does_not_strip_a_leading_ok_from_program_output() {
         // The bug this harness was built for: raw-paste has no `OK` banner,
         // so running stdout through `strip_ok_banner` ate real output.
@@ -1547,6 +2102,62 @@ mod tests {
         // Chunks must divide by 3 or the concatenated base64 gains interior
         // padding and no longer decodes.
         assert_eq!(1536 % 3, 0);
+    }
+
+    #[test]
+    fn write_backs_off_to_smaller_chunks_after_a_device_memory_error() {
+        // A board whose heap is still occupied by an interrupted program
+        // cannot allocate the 2733-byte base64 literal a 2048-byte chunk
+        // compiles to. Halving and re-sending is what turns that into a
+        // completed transfer instead of a "Sync failed" dialog.
+        let data = vec![b'x'; 3000];
+        let (mut dev, port) = fake::device(
+            Some(Paste::Supported),
+            vec![
+                (
+                    "",
+                    "MemoryError: memory allocation failed, allocating 2733 bytes\n",
+                ),
+                ("", ""), // gc.collect()
+                ("", ""), // three 1024-byte chunks
+                ("", ""),
+                ("", ""),
+            ],
+        );
+
+        dev.write_file_direct("/big.bin", &data)
+            .expect("a memory error should be retried, not surfaced");
+
+        let sent = port.written_text();
+        assert!(
+            sent.contains("import gc"),
+            "expected a collect between attempts"
+        );
+        assert_eq!(
+            sent.matches("b = '").count(),
+            4,
+            "expected one failed 2048-byte chunk then three 1024-byte ones, got: {sent}"
+        );
+        // The retry must truncate again rather than append onto the partial file.
+        assert_eq!(sent.matches("'wb'").count(), 2);
+    }
+
+    #[test]
+    fn write_does_not_retry_errors_that_a_smaller_chunk_cannot_fix() {
+        let (mut dev, port) = fake::device(
+            Some(Paste::Supported),
+            vec![("", "OSError: [Errno 2] ENOENT\n"), ("", "")],
+        );
+
+        let err = dev
+            .write_file_direct("/nodir/f.bin", &vec![b'x'; 3000])
+            .expect_err("a missing directory must fail immediately");
+        assert!(matches!(err, MicroPythonError::Remote(_)));
+        assert_eq!(
+            port.written_text().matches("b = '").count(),
+            1,
+            "a non-memory failure must not re-send the file"
+        );
     }
 
     #[test]

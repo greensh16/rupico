@@ -1,8 +1,8 @@
 use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use rupico::micropython;
-use rupico::micropython::join_remote_path;
 use rupico::micropython::vid_looks_micropython;
+use rupico::micropython::{join_remote_path, remote_leaf, remote_parent};
 use rupico::sync;
 use rupico::update;
 use serialport::available_ports;
@@ -108,10 +108,14 @@ enum Command {
         local: String,
     },
 
-    /// Remove a file on the device.
+    /// Remove a file, or a whole directory with `--recursive`.
     Rm {
         /// Remote path on the device.
         path: String,
+
+        /// Remove a directory and everything inside it.
+        #[arg(short = 'r', long)]
+        recursive: bool,
     },
 
     /// Create a directory on the device.
@@ -324,9 +328,9 @@ fn try_main() -> Result<i32, Box<dyn Error>> {
             let opts = device_opts(&cli)?;
             cmd_get(&opts, remote, local)?;
         }
-        Command::Rm { path } => {
+        Command::Rm { path, recursive } => {
             let opts = device_opts(&cli)?;
-            cmd_rm(&opts, path)?;
+            cmd_rm(&opts, path, *recursive, cli.quiet)?;
         }
         Command::Mkdir { path } => {
             let opts = device_opts(&cli)?;
@@ -372,6 +376,7 @@ fn try_main() -> Result<i32, Box<dyn Error>> {
                 // The low-level commands keep no baseline, so they never
                 // detect conflicts and `force` is irrelevant to them.
                 force: true,
+                cancel: None,
             };
             run_sync(
                 &opts,
@@ -399,6 +404,7 @@ fn try_main() -> Result<i32, Box<dyn Error>> {
                 dry_run: *dry_run,
                 ignore: ignore.clone(),
                 force: true,
+                cancel: None,
             };
             run_sync(
                 &opts,
@@ -426,6 +432,9 @@ fn try_main() -> Result<i32, Box<dyn Error>> {
                 dry_run: *dry_run,
                 ignore: ignore.clone(),
                 force: *force,
+                // The CLI runs a sync to completion; nothing can cancel it
+                // mid-flight.
+                cancel: None,
             };
 
             let cwd = std::env::current_dir()?;
@@ -601,11 +610,7 @@ fn cmd_ls(
             let value = ls_entries_to_json(path, entries);
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
-            let entries = with_raw_device(opts, |dev| {
-                let mut out = Vec::<(String, RemoteInfo)>::new();
-                collect_remote_entries(dev, path, "", &mut out)?;
-                Ok(out)
-            })?;
+            let entries = with_raw_device(opts, |dev| fetch_remote_tree(dev, path, true))?;
             let value = ls_recursive_entries_to_json(path, &entries);
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
@@ -638,10 +643,9 @@ fn cmd_ls(
             Ok(())
         })
     } else {
-        with_raw_device(opts, |dev| {
-            print_tree(dev, path, 0, long)?;
-            Ok(())
-        })
+        let entries = with_raw_device(opts, |dev| fetch_remote_tree(dev, path, long))?;
+        print_tree(path, &entries, long);
+        Ok(())
     }
 }
 
@@ -738,11 +742,31 @@ fn cmd_get(opts: &DeviceOpts, remote: &str, local: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn cmd_rm(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
-    with_raw_device(opts, |dev| {
-        dev.remove(path)?;
-        Ok(())
-    })
+fn cmd_rm(
+    opts: &DeviceOpts,
+    path: &str,
+    recursive: bool,
+    quiet: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !recursive {
+        return with_raw_device(opts, |dev| {
+            dev.remove(path)?;
+            Ok(())
+        });
+    }
+
+    let outcome = with_raw_device(opts, |dev| dev.remove_tree(path))?;
+    if !quiet {
+        println!(
+            "Removed {} file{} and {} director{} under {}",
+            outcome.files,
+            if outcome.files == 1 { "" } else { "s" },
+            outcome.dirs,
+            if outcome.dirs == 1 { "y" } else { "ies" },
+            path
+        );
+    }
+    Ok(())
 }
 
 fn cmd_mkdir(opts: &DeviceOpts, path: &str) -> Result<(), Box<dyn Error>> {
@@ -1052,45 +1076,100 @@ fn cmd_stop(opts: &DeviceOpts, quiet: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_tree(
+/// Fetch a whole tree in one round trip, as `(relative path, info)` in the
+/// device's own walk order (a directory immediately before its contents).
+///
+/// This replaced a `list_dir` per directory: on a board where each exec costs
+/// a round trip, listing a project recursively was O(directories) round trips
+/// while sync had long since been doing the same walk in one.
+fn fetch_remote_tree(
     dev: &mut micropython::MicroPythonDevice,
-    path: &str,
+    root: &str,
+    long: bool,
+) -> micropython::Result<Vec<(String, RemoteInfo)>> {
+    let opts = micropython::TreeOptions {
+        hashes: false,
+        mtimes: long,
+    };
+    let tree = dev.list_tree(root, opts)?.ok_or_else(|| {
+        // The walk reports a missing root as `None`; `list_dir` used to let
+        // the device raise, and the exit code for that is worth keeping.
+        micropython::MicroPythonError::Remote(format!(
+            "no such file or directory on device: {root}"
+        ))
+    })?;
+
+    Ok(tree
+        .into_iter()
+        .map(|e| {
+            (
+                e.path,
+                RemoteInfo {
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    modified: e.modified,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Print a fetched tree the way `ls -R` always has: a section per directory,
+/// indented by depth.
+fn print_tree(root: &str, entries: &[(String, RemoteInfo)], long: bool) {
+    print_tree_dir(root, "", entries, 0, long);
+}
+
+fn print_tree_dir(
+    root: &str,
+    rel: &str,
+    entries: &[(String, RemoteInfo)],
     depth: usize,
     long: bool,
-) -> micropython::Result<()> {
+) {
     let indent = "  ".repeat(depth);
+    let path = if rel.is_empty() {
+        root.to_string()
+    } else {
+        join_remote_path(root, rel)
+    };
     println!("{}{}:", indent, path);
-    let entries = dev.list_dir(path)?;
-    for e in &entries {
+
+    let children: Vec<&(String, RemoteInfo)> = entries
+        .iter()
+        .filter(|(p, _)| remote_parent(p) == rel)
+        .collect();
+
+    for (child_rel, info) in &children {
+        let name = remote_leaf(child_rel);
         if long {
-            let mtime = e
+            let mtime = info
                 .modified
                 .map(format_mtime)
                 .unwrap_or_else(|| "-".to_string());
             println!(
                 "{}  {} {} {} {}",
                 indent,
-                if e.is_dir { "d" } else { "-" },
-                e.size,
+                if info.is_dir { "d" } else { "-" },
+                info.size,
                 mtime,
-                e.name
+                name
             );
         } else {
             println!(
                 "{}  {} {}",
                 indent,
-                if e.is_dir { "d" } else { "-" },
-                e.name
+                if info.is_dir { "d" } else { "-" },
+                name
             );
         }
     }
-    for e in entries {
-        if e.is_dir {
-            let child = join_remote_path(path, &e.name);
-            print_tree(dev, &child, depth + 1, long)?;
+
+    for (child_rel, info) in children {
+        if info.is_dir {
+            print_tree_dir(root, child_rel, entries, depth + 1, long);
         }
     }
-    Ok(())
 }
 
 fn cmd_repl(opts: &DeviceOpts, quiet: bool) -> Result<(), Box<dyn Error>> {
@@ -1208,39 +1287,6 @@ struct RemoteInfo {
     modified: Option<u64>,
 }
 
-fn collect_remote_entries(
-    dev: &mut micropython::MicroPythonDevice,
-    remote_root: &str,
-    rel: &str,
-    out: &mut Vec<(String, RemoteInfo)>,
-) -> micropython::Result<()> {
-    let current = if rel.is_empty() {
-        remote_root.to_string()
-    } else {
-        join_remote_path(remote_root, rel)
-    };
-
-    let entries = dev.list_dir(&current)?;
-    for e in entries {
-        let child_rel = if rel.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{}/{}", rel, e.name)
-        };
-        let info = RemoteInfo {
-            is_dir: e.is_dir,
-            size: e.size,
-            modified: e.modified,
-        };
-        out.push((child_rel.clone(), info.clone()));
-        if info.is_dir {
-            collect_remote_entries(dev, remote_root, &child_rel, out)?;
-        }
-    }
-
-    Ok(())
-}
-
 const BLINK_TEMPLATE_BLINK_PY: &str = r#"from machine import Pin
 import time
 
@@ -1285,3 +1331,45 @@ while True:
             uart.write(data)
     time.sleep(0.01)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(is_dir: bool, size: u64) -> RemoteInfo {
+        RemoteInfo {
+            is_dir,
+            size,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn tree_paths_split_into_parent_and_leaf() {
+        assert_eq!(remote_parent("main.py"), "");
+        assert_eq!(remote_parent("lib/thing/mod.py"), "lib/thing");
+        assert_eq!(remote_leaf("main.py"), "main.py");
+        assert_eq!(remote_leaf("lib/thing/mod.py"), "mod.py");
+    }
+
+    #[test]
+    fn recursive_ls_json_keeps_its_documented_shape() {
+        // `--json` is a scripting contract: fields may be added, never
+        // renamed or dropped. This is what `ls -R --json` has always emitted.
+        let entries = vec![
+            ("lib".to_string(), info(true, 0)),
+            ("lib/mod.py".to_string(), info(false, 42)),
+        ];
+        let value = ls_recursive_entries_to_json("/", &entries);
+        let arr = value.as_array().expect("an array of entries");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1]["path"], "/lib/mod.py");
+        assert_eq!(arr[1]["name"], "mod.py");
+        assert_eq!(arr[1]["is_dir"], false);
+        assert_eq!(arr[1]["size"], 42);
+        assert!(
+            arr[1].get("modified").is_some(),
+            "the key must stay present"
+        );
+    }
+}

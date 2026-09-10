@@ -32,7 +32,9 @@ rupico -p /dev/cu.usbmodem101 run /main.py     # run it
   scripts, and project sync. `--json` output and meaningful exit codes for
   scripting.
 - **A desktop app** — file tree, Python editor with syntax highlighting,
-  run/stop, output pane, and a sync panel.
+  run/stop, an output pane with a REPL prompt for typing straight at the board,
+  and a sync panel. Device work runs off the UI thread, so the window stays
+  responsive and cancellable.
 - **A Rust library** — `rupico::micropython` for the device protocol,
   `rupico::sync` for directory sync. Both front ends are built on exactly these.
 
@@ -87,6 +89,7 @@ rupico -p $P run-snippet "print('hi')"     # run a snippet
 rupico -p $P put ./blink.py /blink.py      # upload a file
 rupico -p $P run-local ./blink.py          # run a local file without keeping it
 rupico -p $P flash-main ./blink.py         # make it the boot program
+rupico -p $P rm -r /old_project            # remove a directory and its contents
 ```
 
 On macOS use the `/dev/cu.*` port, not `/dev/tty.*` — the latter blocks waiting
@@ -187,12 +190,15 @@ snippets can only be verified against real hardware.
 ## Status
 
 The CLI is the supported interface and the right tool for bulk transfers. The
-GUI is usable but still experimental — its device I/O runs on the UI thread, so
-the window briefly freezes during long operations.
+desktop app is still young, but it no longer blocks: device I/O runs on its own
+thread, so the window keeps drawing during a transfer and every long operation
+can be cancelled from the status bar. Its output still arrives when a run
+finishes rather than line by line as the board prints it.
 
-## Changelog
+## Changelog and roadmap
 
-See [CHANGELOG.md](CHANGELOG.md).
+Recent changes are in [CHANGELOG.md](CHANGELOG.md); what is planned, and what
+stands between here and 1.0, is in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

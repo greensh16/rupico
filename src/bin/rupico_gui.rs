@@ -15,13 +15,15 @@
 use eframe::egui;
 use egui::text::LayoutJob;
 use rupico::micropython::{
-    ExecResult, MicroPythonDevice, MicroPythonError, Result as MpResult, join_remote_path,
-    vid_looks_micropython,
+    self, ExecResult, InterruptHandle, MicroPythonDevice, Result as MpResult, TreeOptions,
+    join_remote_path, remote_leaf, remote_parent, vid_looks_micropython,
 };
 use rupico::sync;
 use rupico::update;
 use serialport::available_ports;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -136,6 +138,7 @@ mod sym {
     pub const FLASH: &str = "⚡  Flash";
     pub const REBOOT: &str = "⟲  Reboot";
     pub const SYNC: &str = "Sync";
+    pub const REPL: &str = "REPL";
     pub const CONNECTED_DOT: &str = "⏺";
     pub const DISCONNECTED_DOT: &str = "⏹";
     pub const REFRESH: &str = "⟳";
@@ -368,6 +371,147 @@ enum OutputFilter {
     Stderr,
 }
 
+/// Which view the bottom dock is showing.
+///
+/// Output and the REPL are the same kind of thing — a transcript of what the
+/// board said — so they share one resizable dock rather than competing for
+/// vertical space.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DockTab {
+    Output,
+    Repl,
+}
+
+/// One exchange in the REPL scrollback.
+struct ReplEntry {
+    /// What the user submitted, or `None` for a line rupico itself printed
+    /// (a connection failure, say) so notes cannot be mistaken for input.
+    source: Option<String>,
+    stdout: String,
+    stderr: String,
+    /// The entry is on the board and its result has not come back yet. The
+    /// prompt echoes immediately, so this marks the gap.
+    pending: bool,
+}
+
+/// Scrollback and input state for the REPL dock.
+///
+/// Entries run through `MicroPythonDevice::run_repl_entry` on the existing
+/// raw-REPL connection, so the prompt shares the board's globals with the Run
+/// button and the file tree keeps working between commands. It is not a
+/// terminal emulator: output arrives when the entry finishes, not as it is
+/// printed.
+#[derive(Default)]
+struct ReplPanel {
+    input: String,
+    entries: Vec<ReplEntry>,
+    /// Submitted entries, oldest first, for Up/Down recall.
+    history: Vec<String>,
+    /// Where Up/Down currently sits in `history`. `None` is the live edit,
+    /// which is what Down comes back to.
+    history_pos: Option<usize>,
+    /// Set when the input should take keyboard focus on the next frame.
+    focus_input: bool,
+}
+
+/// How much scrollback to keep.
+///
+/// A session that leaves a sensor loop printing can produce entries without
+/// bound; the oldest ones are the ones nobody scrolls back to.
+const MAX_REPL_ENTRIES: usize = 400;
+
+impl ReplPanel {
+    /// Id of the input field, needed before the widget is built so Enter and
+    /// the arrow keys can be claimed only while it has focus.
+    fn input_id() -> egui::Id {
+        egui::Id::new("repl_input")
+    }
+
+    fn push(&mut self, entry: ReplEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > MAX_REPL_ENTRIES {
+            let excess = self.entries.len() - MAX_REPL_ENTRIES;
+            self.entries.drain(..excess);
+        }
+    }
+
+    /// Remember a submitted entry, skipping an immediate repeat so holding
+    /// Up walks distinct commands.
+    fn remember(&mut self, source: &str) {
+        if self.history.last().map(String::as_str) != Some(source) {
+            self.history.push(source.to_string());
+        }
+        self.history_pos = None;
+    }
+
+    /// Step back through history, oldest-ward.
+    fn recall_older(&mut self) {
+        let pos = match self.history_pos {
+            None => self.history.len().checked_sub(1),
+            Some(0) => Some(0),
+            Some(i) => Some(i - 1),
+        };
+        if let Some(i) = pos {
+            self.history_pos = Some(i);
+            self.input = self.history[i].clone();
+        }
+    }
+
+    /// Step forward through history; past the newest entry is the empty line
+    /// the user was typing before they started recalling.
+    fn recall_newer(&mut self) {
+        match self.history_pos {
+            Some(i) if i + 1 < self.history.len() => {
+                self.history_pos = Some(i + 1);
+                self.input = self.history[i + 1].clone();
+            }
+            Some(_) => {
+                self.history_pos = None;
+                self.input.clear();
+            }
+            None => {}
+        }
+    }
+}
+
+/// Take a keypress with *no* modifiers at all out of the event queue.
+///
+/// `InputState::consume_key(Modifiers::NONE, ..)` is not this: it matches
+/// modifiers logically and ignores Shift, so it claims Shift-Enter too — which
+/// submitted the REPL entry instead of breaking the line, and claimed
+/// Shift-Up instead of extending the selection.
+fn take_bare_key(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let mut hit = false;
+    input.events.retain(|event| {
+        let bare = matches!(
+            event,
+            egui::Event::Key {
+                key: pressed_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *pressed_key == key && modifiers.matches_exact(egui::Modifiers::NONE)
+        );
+        hit |= bare;
+        !bare
+    });
+    hit
+}
+
+/// Render a submitted entry the way an interactive prompt would, so a pasted
+/// block reads as one submission rather than several.
+fn prompt_block(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 4);
+    for (i, line) in source.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(if i == 0 { ">>> " } else { "... " });
+        out.push_str(line);
+    }
+    out
+}
+
 /// Something the tree asked for this frame.
 ///
 /// Collected rather than acted on inline, because the recursive render only
@@ -393,6 +537,10 @@ struct SyncPanel {
     remote_dir: String,
     /// Delete entries on the destination that are absent from the source.
     delete: bool,
+    /// Skip files and directories whose name starts with `.`.
+    skip_hidden: bool,
+    /// Skip Markdown files, which are documentation the board never runs.
+    skip_markdown: bool,
     /// Download instead of upload.
     from_device: bool,
     /// Result of the last run, kept on screen so a preview can be read before
@@ -400,6 +548,32 @@ struct SyncPanel {
     last: Option<sync::SyncOutcome>,
     /// Whether `last` came from a dry run.
     last_was_preview: bool,
+    /// Decisions from the run in flight, as they arrive.
+    live: Vec<sync::SyncAction>,
+}
+
+/// Ignore pattern matching any component starting with a dot.
+const HIDDEN_IGNORE: &str = ".*";
+/// Ignore pattern for Markdown files.
+const MARKDOWN_IGNORE: &str = "*.md";
+
+impl SyncPanel {
+    /// Ignore patterns for the panel's exclusion checkboxes.
+    ///
+    /// These layer on top of the engine's built-ins rather than filtering
+    /// separately, so an excluded file is also protected from a `delete`
+    /// pass: the engine drops ignored entries from both sides before
+    /// comparing them, so they are never seen as "absent from the source".
+    fn ignore_patterns(&self) -> Vec<String> {
+        let mut pats = Vec::new();
+        if self.skip_hidden {
+            pats.push(HIDDEN_IGNORE.to_string());
+        }
+        if self.skip_markdown {
+            pats.push(MARKDOWN_IGNORE.to_string());
+        }
+        pats
+    }
 }
 
 impl Default for SyncPanel {
@@ -409,9 +583,15 @@ impl Default for SyncPanel {
             local_dir: None,
             remote_dir: "/".to_string(),
             delete: false,
+            // Both default off: the panel remembers its settings, and an
+            // exclusion that switched itself on would quietly change what an
+            // existing setup syncs.
+            skip_hidden: false,
+            skip_markdown: false,
             from_device: false,
             last: None,
             last_was_preview: false,
+            live: Vec::new(),
         }
     }
 }
@@ -426,6 +606,10 @@ struct Prefs {
     sync_local_dir: Option<PathBuf>,
     #[serde(default)]
     sync_remote_dir: Option<String>,
+    #[serde(default)]
+    sync_skip_hidden: bool,
+    #[serde(default)]
+    sync_skip_markdown: bool,
     #[serde(default)]
     last_port: Option<String>,
 }
@@ -477,11 +661,706 @@ struct UpdatePanel {
     available: Option<update::Release>,
 }
 
+// ---------------------------------------------------------------------------
+// Device worker
+// ---------------------------------------------------------------------------
+
+/// Work the UI hands to the device thread.
+///
+/// Every variant is one user action, and the thread runs them in the order
+/// they were sent — so a queued job that needs a connection can simply be
+/// sent behind `Connect`. Stopping a running program is deliberately *not*
+/// here: it has to reach a device whose thread is blocked reading, so it goes
+/// down the interrupt handle instead.
+enum Job {
+    Connect {
+        port: String,
+    },
+    Disconnect,
+    /// Put the connection back in raw REPL after an interrupt.
+    Resync,
+    RefreshTree,
+    Open {
+        path: String,
+    },
+    Save {
+        path: String,
+        text: String,
+    },
+    Create {
+        path: String,
+    },
+    Delete {
+        path: String,
+        is_dir: bool,
+        recursive: bool,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
+    RunScript {
+        path: Option<String>,
+        text: String,
+        save_first: bool,
+    },
+    RunRepl {
+        source: String,
+    },
+    Flash {
+        text: String,
+    },
+    RunMain,
+    Sync {
+        local: PathBuf,
+        remote: String,
+        opts: sync::SyncOptions,
+        from_device: bool,
+        preview: bool,
+    },
+    Shutdown,
+}
+
+/// What kind of work a job is, which decides what cancelling it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    /// Runs user code on the board. Only Ctrl-C stops it.
+    Exec,
+    /// A long loop the worker can be asked to leave early.
+    Cancellable,
+    /// Short enough that cancelling is meaningless.
+    Quick,
+}
+
+impl Job {
+    /// What the status bar says while this runs.
+    fn label(&self) -> String {
+        match self {
+            Job::Connect { port } => format!("Connecting to {}", short_port(port)),
+            Job::Disconnect => "Disconnecting".to_string(),
+            Job::Resync => "Resynchronising".to_string(),
+            Job::RefreshTree => "Listing device files".to_string(),
+            Job::Open { path } => format!("Opening {path}"),
+            Job::Save { path, .. } => format!("Saving {path}"),
+            Job::Create { path } => format!("Creating {path}"),
+            Job::Delete { path, .. } => format!("Deleting {path}"),
+            Job::Rename { old, .. } => format!("Renaming {old}"),
+            Job::RunScript { path, .. } => match path {
+                Some(p) => format!("Running {p}"),
+                None => "Running buffer".to_string(),
+            },
+            Job::RunRepl { .. } => "Running REPL entry".to_string(),
+            Job::Flash { .. } => "Flashing main.py".to_string(),
+            Job::RunMain => "Rebooting".to_string(),
+            Job::Sync { preview: true, .. } => "Previewing sync".to_string(),
+            Job::Sync { .. } => "Syncing".to_string(),
+            Job::Shutdown => "Closing".to_string(),
+        }
+    }
+
+    fn kind(&self) -> JobKind {
+        match self {
+            Job::RunScript { .. } | Job::RunRepl { .. } | Job::RunMain => JobKind::Exec,
+            Job::Sync { .. } => JobKind::Cancellable,
+            _ => JobKind::Quick,
+        }
+    }
+}
+
+/// What the device thread reports back.
+enum Update {
+    Started(String, JobKind),
+    Finished,
+    Connected(String),
+    Disconnected,
+    Tree(Vec<RemoteNode>),
+    Opened {
+        path: String,
+        text: String,
+    },
+    Saved {
+        path: String,
+    },
+    Created {
+        path: String,
+    },
+    Deleted {
+        path: String,
+    },
+    Renamed {
+        old: String,
+        new: String,
+    },
+    Output(ExecResult),
+    Repl {
+        source: String,
+        stdout: String,
+        stderr: String,
+    },
+    Status(String),
+    SyncProgress(sync::SyncAction),
+    SyncDone {
+        outcome: Box<sync::SyncOutcome>,
+        preview: bool,
+        from_device: bool,
+    },
+    /// Something the board printed to stderr without raising.
+    Notice(String),
+    Failed {
+        what: String,
+        message: String,
+        connected: bool,
+    },
+}
+
+/// The UI's end of the device thread.
+struct DeviceLink {
+    jobs: mpsc::Sender<Job>,
+    updates: mpsc::Receiver<Update>,
+    /// Asks the running job to stop at its next safe boundary.
+    cancel: Arc<AtomicBool>,
+    /// A writer for Ctrl-C, usable while the worker is blocked mid-exec.
+    interrupt: Arc<Mutex<Option<InterruptHandle>>>,
+}
+
+impl DeviceLink {
+    fn spawn(ctx: egui::Context) -> Self {
+        let (jobs, job_rx) = mpsc::channel();
+        let (update_tx, updates) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupt = Arc::new(Mutex::new(None));
+
+        let worker = DeviceWorker {
+            device: None,
+            updates: update_tx,
+            cancel: Arc::clone(&cancel),
+            interrupt: Arc::clone(&interrupt),
+            ctx,
+        };
+        std::thread::Builder::new()
+            .name("rupico-device".to_string())
+            .spawn(move || worker.run(job_rx))
+            .expect("spawn the device thread");
+
+        Self {
+            jobs,
+            updates,
+            cancel,
+            interrupt,
+        }
+    }
+
+    /// Queue a job. A closed channel means the worker is gone, which only
+    /// happens as the app exits.
+    fn send(&self, job: Job) {
+        let _ = self.jobs.send(job);
+    }
+
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Write Ctrl-C to the board from *this* thread.
+    ///
+    /// The point of the second handle: the worker is usually blocked reading
+    /// the output of exactly the program the user wants to stop.
+    fn interrupt(&self) -> std::result::Result<(), String> {
+        let mut guard = self.interrupt.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(handle) => handle.interrupt().map_err(|e| e.to_string()),
+            None => Err("Not connected".to_string()),
+        }
+    }
+}
+
+impl Drop for DeviceLink {
+    fn drop(&mut self) {
+        // Give the worker the chance to leave the board in the friendly REPL.
+        // Not joined: the process is on its way out, and a join could block
+        // behind a transfer that is still running.
+        self.send(Job::Shutdown);
+    }
+}
+
+/// The device thread: owns the connection, and is the only place that talks
+/// to the board.
+struct DeviceWorker {
+    device: Option<MicroPythonDevice>,
+    updates: mpsc::Sender<Update>,
+    cancel: Arc<AtomicBool>,
+    interrupt: Arc<Mutex<Option<InterruptHandle>>>,
+    ctx: egui::Context,
+}
+
+impl DeviceWorker {
+    fn send(&self, update: Update) {
+        if self.updates.send(update).is_ok() {
+            // An idle egui window redraws only on input, so without this the
+            // update would sit in the channel until the user moved the mouse.
+            self.ctx.request_repaint();
+        }
+    }
+
+    fn run(mut self, jobs: mpsc::Receiver<Job>) {
+        while let Ok(job) = jobs.recv() {
+            if matches!(job, Job::Shutdown) {
+                break;
+            }
+            // The flag belongs to the job that is about to run; a cancel that
+            // arrived while nothing was running must not kill the next thing
+            // the user asks for.
+            self.cancel.store(false, Ordering::Relaxed);
+            self.send(Update::Started(job.label(), job.kind()));
+            self.run_job(job);
+            self.report_device_notices();
+            self.send(Update::Finished);
+        }
+        self.disconnect();
+    }
+
+    fn run_job(&mut self, job: Job) {
+        match job {
+            Job::Connect { port } => self.connect(&port),
+            Job::Disconnect => {
+                self.disconnect();
+                self.send(Update::Disconnected);
+            }
+            Job::Resync => {
+                if let Some(dev) = self.device.as_mut()
+                    && dev.recover().is_err()
+                {
+                    self.drop_device();
+                    self.send(Update::Disconnected);
+                }
+            }
+            Job::RefreshTree => self.refresh_tree(),
+            Job::Open { path } => {
+                if let Some(text) = self.attempt(&format!("Failed to open {path}"), |dev| {
+                    dev.read_text_file(&path)
+                }) {
+                    self.send(Update::Opened { path, text });
+                }
+            }
+            Job::Save { path, text } => {
+                if self
+                    .attempt(&format!("Failed to save {path}"), |dev| {
+                        dev.write_text_file(&path, &text)
+                    })
+                    .is_some()
+                {
+                    self.send(Update::Saved { path });
+                }
+            }
+            Job::Create { path } => {
+                if self
+                    .attempt(&format!("Failed to create {path}"), |dev| {
+                        dev.write_text_file(&path, "")
+                    })
+                    .is_some()
+                {
+                    self.send(Update::Created { path });
+                    self.refresh_tree();
+                }
+            }
+            Job::Delete {
+                path,
+                is_dir,
+                recursive,
+            } => {
+                let what = format!("Failed to delete {path}");
+                let done = if recursive {
+                    self.attempt(&what, |dev| {
+                        dev.remove_tree(&path).map(|o| {
+                            format!("Deleted {} file(s) and {} folder(s)", o.files, o.dirs)
+                        })
+                    })
+                } else if is_dir {
+                    self.attempt(&what, |dev| dev.rmdir(&path).map(|()| String::new()))
+                } else {
+                    self.attempt(&what, |dev| dev.remove(&path).map(|()| String::new()))
+                };
+                if let Some(note) = done {
+                    if !note.is_empty() {
+                        self.send(Update::Status(note));
+                    }
+                    self.send(Update::Deleted { path });
+                    self.refresh_tree();
+                }
+            }
+            Job::Rename { old, new } => {
+                if self
+                    .attempt(&format!("Failed to rename {old}"), |dev| {
+                        dev.rename(&old, &new)
+                    })
+                    .is_some()
+                {
+                    self.send(Update::Renamed { old, new });
+                    self.refresh_tree();
+                }
+            }
+            Job::RunScript {
+                path,
+                text,
+                save_first,
+            } => self.run_script(path, text, save_first),
+            Job::RunRepl { source } => {
+                match self.attempt("REPL error", |dev| dev.run_repl_entry(&source)) {
+                    Some(res) => self.send(Update::Repl {
+                        source,
+                        stdout: res.stdout,
+                        stderr: res.stderr,
+                    }),
+                    None => self.send(Update::Repl {
+                        source,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }),
+                }
+            }
+            Job::Flash { text } => {
+                if self
+                    .attempt("Failed to flash main.py", |dev| {
+                        dev.flash_main_script(&text)
+                    })
+                    .is_some()
+                {
+                    self.send(Update::Status("Flashed active tab as main.py".to_string()));
+                    self.refresh_tree();
+                }
+            }
+            Job::RunMain => self.run_main(),
+            Job::Sync {
+                local,
+                remote,
+                opts,
+                from_device,
+                preview,
+            } => self.run_sync(local, remote, opts, from_device, preview),
+            Job::Shutdown => {}
+        }
+    }
+
+    /// Run one device call, reporting failure and putting the connection back
+    /// into a known state.
+    ///
+    /// A raw-REPL failure usually means the protocol desynced partway through
+    /// a frame. Leaving the handle open would make every later operation fail
+    /// in confusing ways against a connection that still looks healthy, so we
+    /// re-interrupt and re-enter raw REPL — and if even that fails, the handle
+    /// is dropped so the UI shows an honest "disconnected".
+    fn attempt<T>(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut MicroPythonDevice) -> MpResult<T>,
+    ) -> Option<T> {
+        let result = match self.device.as_mut() {
+            Some(dev) => f(dev),
+            None => {
+                self.send(Update::Failed {
+                    what: what.to_string(),
+                    message: "not connected".to_string(),
+                    connected: false,
+                });
+                return None;
+            }
+        };
+
+        match result {
+            Ok(value) => Some(value),
+            Err(e) => {
+                let message = e.to_string();
+                let recovered = matches!(self.device.as_mut().map(|d| d.recover()), Some(Ok(())));
+                if !recovered {
+                    self.drop_device();
+                }
+                self.send(Update::Failed {
+                    what: what.to_string(),
+                    message,
+                    connected: recovered,
+                });
+                None
+            }
+        }
+    }
+
+    fn connect(&mut self, port: &str) {
+        self.disconnect();
+
+        let mut dev = match MicroPythonDevice::connect(port) {
+            Ok(mut d) => {
+                // The 3 s default suited a UI that blocked on every call: it
+                // bounded how long the window could freeze. Nothing freezes
+                // now, and the deadline resets whenever the board sends a
+                // byte, so a generous idle limit just means a sleepy program
+                // finishes instead of failing. It stays finite so a pulled
+                // cable still surfaces as an error rather than a wedged job,
+                // and Stop interrupts anything longer.
+                d.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                d
+            }
+            Err(e) => {
+                self.send(Update::Failed {
+                    what: "Failed to connect".to_string(),
+                    message: e.to_string(),
+                    connected: false,
+                });
+                return;
+            }
+        };
+        if let Err(e) = dev.enter_raw_repl() {
+            self.send(Update::Failed {
+                what: "Failed to enter raw REPL".to_string(),
+                message: e.to_string(),
+                connected: false,
+            });
+            return;
+        }
+
+        match dev.interrupt_handle() {
+            Ok(handle) => *self.interrupt.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle),
+            // Worth saying out loud: without it, Stop cannot reach a board
+            // that is already running something.
+            Err(e) => self.send(Update::Notice(format!(
+                "Stop will not work on this port: {e}"
+            ))),
+        }
+
+        self.device = Some(dev);
+        self.send(Update::Connected(port.to_string()));
+        self.refresh_tree();
+    }
+
+    /// Close the connection, leaving the board in the friendly REPL.
+    fn disconnect(&mut self) {
+        if let Some(mut dev) = self.device.take() {
+            let _ = dev.exit_raw_repl();
+        }
+        *self.interrupt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Drop a connection that is past saving, without trying to talk on it.
+    fn drop_device(&mut self) {
+        self.device = None;
+        *self.interrupt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn refresh_tree(&mut self) {
+        // Metadata only: the rail shows names, and hashing would read every
+        // file on the board to draw them.
+        let entries = self.attempt("Failed to list device files", |dev| {
+            dev.list_tree("/", TreeOptions::metadata_only())
+        });
+        match entries {
+            Some(Some(entries)) => self.send(Update::Tree(tree_from_entries(&entries, "/"))),
+            Some(None) => self.send(Update::Tree(Vec::new())),
+            None => self.send(Update::Tree(Vec::new())),
+        }
+    }
+
+    fn run_script(&mut self, path: Option<String>, text: String, save_first: bool) {
+        if save_first && let Some(remote) = path.clone() {
+            if self
+                .attempt("Failed to save before run", |dev| {
+                    dev.write_text_file(&remote, &text)
+                })
+                .is_none()
+            {
+                return;
+            }
+            self.send(Update::Saved { path: remote });
+        }
+
+        let result = match &path {
+            Some(remote) => {
+                let remote = remote.clone();
+                self.attempt("Execution error", move |dev| dev.run_file(&remote))
+            }
+            None => self.attempt("Execution error", |dev| dev.run_snippet(&text)),
+        };
+        if let Some(res) = result {
+            self.send(Update::Status(
+                if res.stderr.trim().is_empty() {
+                    "Run finished"
+                } else {
+                    "Run raised an exception"
+                }
+                .to_string(),
+            ));
+            self.send(Update::Output(res));
+        }
+    }
+
+    fn run_main(&mut self) {
+        // The soft reboot leaves the board outside raw REPL, so the handle is
+        // dropped deliberately rather than kept in a state we cannot use.
+        let Some(mut dev) = self.device.take() else {
+            self.send(Update::Failed {
+                what: "Failed to run main.py".to_string(),
+                message: "not connected".to_string(),
+                connected: false,
+            });
+            return;
+        };
+        let outcome = dev.run_main();
+        self.drop_device();
+
+        match outcome {
+            Ok(()) => {
+                self.send(Update::Output(ExecResult {
+                    stdout: "Soft reboot triggered; boot.py / main.py should run on the device.\n\
+                             Reconnect to regain the raw REPL.\n"
+                        .to_string(),
+                    stderr: String::new(),
+                }));
+                self.send(Update::Status("Soft reboot triggered".to_string()));
+                self.send(Update::Disconnected);
+                self.send(Update::Tree(Vec::new()));
+            }
+            Err(e) => {
+                self.send(Update::Failed {
+                    what: "Failed to run main.py".to_string(),
+                    message: e.to_string(),
+                    connected: false,
+                });
+                self.send(Update::Disconnected);
+            }
+        }
+    }
+
+    fn run_sync(
+        &mut self,
+        local: PathBuf,
+        remote: String,
+        opts: sync::SyncOptions,
+        from_device: bool,
+        preview: bool,
+    ) {
+        let updates = self.updates.clone();
+        let ctx = self.ctx.clone();
+        // Each decision is reported as it is made, so a long sync shows its
+        // progress instead of one silent pause and a summary.
+        let mut report = move |action: &sync::SyncAction| {
+            let _ = updates.send(Update::SyncProgress(action.clone()));
+            ctx.request_repaint();
+        };
+
+        let outcome = {
+            let result = match self.device.as_mut() {
+                Some(dev) => {
+                    if from_device {
+                        sync::from_device(dev, &remote, &local, &opts, None, Some(&mut report))
+                    } else {
+                        sync::to_device(dev, &local, &remote, &opts, None, Some(&mut report))
+                    }
+                }
+                None => {
+                    self.send(Update::Failed {
+                        what: "Sync failed".to_string(),
+                        message: "not connected".to_string(),
+                        connected: false,
+                    });
+                    return;
+                }
+            };
+            match result {
+                Ok(o) => o,
+                Err(e) => {
+                    let message = e.to_string();
+                    let recovered =
+                        matches!(self.device.as_mut().map(|d| d.recover()), Some(Ok(())));
+                    if !recovered {
+                        self.drop_device();
+                    }
+                    self.send(Update::Failed {
+                        what: "Sync failed".to_string(),
+                        message,
+                        connected: recovered,
+                    });
+                    return;
+                }
+            }
+        };
+
+        let cancelled = outcome.cancelled;
+        self.send(Update::SyncDone {
+            outcome: Box::new(outcome),
+            preview,
+            from_device,
+        });
+        if cancelled {
+            self.send(Update::Status("Sync cancelled".to_string()));
+        }
+        if !preview {
+            self.refresh_tree();
+        }
+    }
+
+    /// Forward anything the board printed to stderr without raising.
+    fn report_device_notices(&mut self) {
+        let notices = match self.device.as_mut() {
+            Some(dev) => dev.take_remote_warnings(),
+            None => return,
+        };
+        for notice in notices {
+            self.send(Update::Notice(notice));
+        }
+    }
+}
+
+/// One line of live sync progress.
+fn sync_action_line(action: &sync::SyncAction) -> String {
+    let target = action
+        .remote
+        .as_deref()
+        .or(action.local.as_deref())
+        .unwrap_or("");
+    format!("{} {}", action.op, target)
+}
+
+/// Build the display tree from one flat walk.
+///
+/// Entries arrive relative to `root`, a parent always before its children.
+fn tree_from_entries(entries: &[micropython::RemoteTreeEntry], root: &str) -> Vec<RemoteNode> {
+    fn children(
+        entries: &[micropython::RemoteTreeEntry],
+        root: &str,
+        parent: &str,
+    ) -> Vec<RemoteNode> {
+        let mut nodes: Vec<RemoteNode> = entries
+            .iter()
+            .filter(|e| remote_parent(&e.path) == parent)
+            .map(|e| RemoteNode {
+                name: remote_leaf(&e.path).to_string(),
+                path: join_remote_path(root, &e.path),
+                is_dir: e.is_dir,
+                children: if e.is_dir {
+                    children(entries, root, &e.path)
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        // Directories first, then files, each alphabetically.
+        nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        nodes
+    }
+
+    children(entries, root, "")
+}
+
 struct GuiApp {
     // Connection
     available_ports: Vec<PortEntry>,
     selected_port: Option<String>,
-    device: Option<MicroPythonDevice>,
+    /// The device thread. All serial I/O happens over there, so a transfer
+    /// never stops this one from drawing.
+    link: DeviceLink,
+    connected: bool,
+    /// A connect is queued but has not reported back yet, so a second action
+    /// does not queue a second one.
+    connecting: bool,
+    /// Label of the job in flight, and what cancelling it would mean.
+    busy: Option<(String, JobKind)>,
     connection_error: Option<String>,
 
     // Device filesystem
@@ -493,10 +1372,12 @@ struct GuiApp {
     tabs: Vec<EditorTab>,
     active_tab: usize,
 
-    // Output dock
+    // Bottom dock: program output and the REPL
     last_output: Option<ExecResult>,
     output_open: bool,
     output_filter: OutputFilter,
+    dock_tab: DockTab,
+    repl: ReplPanel,
 
     // Transient interaction state
     last_status: Option<String>,
@@ -504,13 +1385,18 @@ struct GuiApp {
     renaming: Option<(String, String)>,
     /// Inline "new file" in the tree: (parent directory, edited name).
     creating: Option<(String, String)>,
-    confirm_delete: Option<(String, bool)>,
+    /// Pending delete: (path, is_dir, delete contents too).
+    confirm_delete: Option<(String, bool, bool)>,
     sync_panel: SyncPanel,
     update_panel: UpdatePanel,
 }
 
-impl Default for GuiApp {
-    fn default() -> Self {
+impl GuiApp {
+    /// Build the app and start its device thread.
+    ///
+    /// The thread needs the `Context` so it can wake an idle window when an
+    /// update arrives; that is why this is not `Default`.
+    fn new(ctx: &egui::Context) -> Self {
         let prefs = Prefs::load();
         let available_ports = list_ports();
         // A port the user chose last time wins, as long as it is still here.
@@ -521,12 +1407,17 @@ impl Default for GuiApp {
         let sync_panel = SyncPanel {
             local_dir: prefs.sync_local_dir,
             remote_dir: prefs.sync_remote_dir.unwrap_or_else(|| "/".to_string()),
+            skip_hidden: prefs.sync_skip_hidden,
+            skip_markdown: prefs.sync_skip_markdown,
             ..SyncPanel::default()
         };
         Self {
             available_ports,
             selected_port,
-            device: None,
+            link: DeviceLink::spawn(ctx.clone()),
+            connected: false,
+            connecting: false,
+            busy: None,
             connection_error: None,
             remote_tree: Vec::new(),
             selected_remote_path: None,
@@ -536,6 +1427,8 @@ impl Default for GuiApp {
             last_output: None,
             output_open: false,
             output_filter: OutputFilter::All,
+            dock_tab: DockTab::Output,
+            repl: ReplPanel::default(),
             last_status: None,
             renaming: None,
             creating: None,
@@ -625,241 +1518,144 @@ fn parent_of(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 impl GuiApp {
-    /// Report a failed device operation and put the connection back into a
-    /// known state.
+    /// Queue a connect ahead of the job about to be sent, if one is needed.
     ///
-    /// A raw-REPL failure usually means the protocol desynced partway through
-    /// a frame. Leaving the handle open would make every later operation fail
-    /// in confusing ways against a connection that still looks healthy, so we
-    /// re-interrupt and re-enter raw REPL. If even that fails the handle is
-    /// dropped, so the user gets an honest "disconnected" instead of a dead
-    /// connection that still shows as connected.
-    fn fail_device_op(&mut self, what: &str, e: MicroPythonError) {
-        self.connection_error = Some(format!("{what}: {e}"));
-
-        let recovered = matches!(self.device.as_mut().map(|d| d.recover()), Some(Ok(())));
-        if recovered {
-            self.last_status = Some(format!("{what} (connection resynchronised)"));
-        } else {
-            self.device = None;
-            self.last_status = Some(format!("{what} (disconnected)"));
-        }
-    }
-
+    /// Jobs run in order, so an action taken while disconnected simply lands
+    /// behind the connect it implies.
     fn ensure_connected(&mut self) {
-        if self.device.is_some() {
+        if self.connected || self.connecting {
             return;
         }
-
-        let port = match self.selected_port.clone() {
-            Some(p) => p,
-            None => {
-                self.connection_error = Some("No port selected".to_string());
-                return;
-            }
+        let Some(port) = self.selected_port.clone() else {
+            self.connection_error = Some("No port selected".to_string());
+            return;
         };
+        self.connecting = true;
+        self.link.send(Job::Connect { port });
+    }
 
-        match MicroPythonDevice::connect(&port) {
-            Ok(mut dev) => {
-                if let Err(e) = dev.enter_raw_repl() {
-                    self.connection_error = Some(format!("Failed to enter raw REPL: {e}"));
-                    self.last_status = Some("Failed to enter raw REPL".to_string());
-                    return;
-                }
-                self.connection_error = None;
-                self.last_status = Some(format!("Connected to {}", short_port(&port)));
-                self.device = Some(dev);
-            }
-            Err(e) => {
-                self.connection_error = Some(format!("Failed to connect: {e}"));
-                self.last_status = Some("Failed to connect".to_string());
-            }
+    /// Send a job, connecting first if that has not happened yet.
+    ///
+    /// Returns whether the job was actually queued: a caller that has already
+    /// shown something on screen (the REPL echoes its entry immediately) has
+    /// to undo that when there is no connection to send it to.
+    fn device_job(&mut self, job: Job) -> bool {
+        self.ensure_connected();
+        if !self.connected && !self.connecting {
+            // No port selected; `ensure_connected` has already said so.
+            return false;
         }
+        self.link.send(job);
+        true
     }
 
     fn connect_and_list(&mut self) {
+        // Connecting refreshes the tree on the worker side.
         self.ensure_connected();
-        if self.device.is_some() {
-            self.refresh_remote_tree();
-        }
     }
 
     fn disconnect(&mut self) {
-        if let Some(mut dev) = self.device.take() {
-            let _ = dev.exit_raw_repl();
-        }
-        self.remote_tree.clear();
-        self.last_status = Some("Disconnected".to_string());
+        self.link.send(Job::Disconnect);
     }
 
+    /// Interrupt whatever the board is running.
+    ///
+    /// Goes down the interrupt handle rather than the job queue: the worker
+    /// is usually blocked reading the output of the very program being
+    /// stopped, so a queued job would not be looked at until it finished.
     fn stop_program(&mut self) {
-        self.ensure_connected();
-        let stopped = match self.device.as_mut() {
-            Some(d) => d.stop_current_program().and_then(|()| d.enter_raw_repl()),
-            None => return,
-        };
-
-        if let Err(e) = stopped {
-            self.fail_device_op("Failed to stop program", e);
-            return;
+        match self.link.interrupt() {
+            Ok(()) => {
+                self.last_status = Some("Sent Ctrl-C to the board".to_string());
+                self.link.send(Job::Resync);
+            }
+            Err(e) => {
+                self.connection_error = Some(format!("Could not interrupt the device: {e}"));
+            }
         }
-        self.last_status = Some("Program stopped".to_string());
+    }
+
+    /// Stop the job in flight, in whatever way that job can be stopped.
+    fn cancel_current(&mut self) {
+        match self.busy.as_ref().map(|(_, kind)| *kind) {
+            // Board-side code only stops for Ctrl-C.
+            Some(JobKind::Exec) => self.stop_program(),
+            Some(JobKind::Cancellable) => {
+                self.link.request_cancel();
+                self.last_status = Some("Stopping after the current file".to_string());
+            }
+            _ => {}
+        }
     }
 
     fn flash_active_as_main(&mut self) {
-        self.ensure_connected();
         let text = self.tabs[self.active_tab].text.clone();
-        let flashed = match self.device.as_mut() {
-            Some(d) => d.flash_main_script(&text),
-            None => return,
-        };
-
-        if let Err(e) = flashed {
-            self.fail_device_op("Failed to flash main.py", e);
-            return;
-        }
-        self.last_status = Some("Flashed active tab as main.py".to_string());
-        self.refresh_remote_tree();
+        self.device_job(Job::Flash { text });
     }
 
     fn run_main_script(&mut self) {
-        // The soft reboot leaves the board outside raw REPL, so the handle is
-        // dropped deliberately rather than kept in a state we cannot use.
-        self.ensure_connected();
-        let mut dev = match self.device.take() {
-            Some(d) => d,
-            None => {
-                self.last_status = Some("No device connected".to_string());
-                return;
-            }
-        };
-
-        match dev.run_main() {
-            Ok(()) => {
-                self.last_status = Some("Soft reboot triggered".to_string());
-                self.set_output(ExecResult {
-                    stdout: "Soft reboot triggered; boot.py / main.py should run on the device.\n\
-                             Reconnect to regain the raw REPL.\n"
-                        .to_string(),
-                    stderr: String::new(),
-                });
-                self.remote_tree.clear();
-            }
-            Err(e) => {
-                self.connection_error = Some(format!("Failed to run main.py: {e}"));
-                self.last_status = Some("Failed to run main.py".to_string());
-            }
-        }
+        self.device_job(Job::RunMain);
     }
 
     fn run_current_script(&mut self) {
-        self.ensure_connected();
-
-        let path = self.tabs[self.active_tab].path.clone();
-        let text = self.tabs[self.active_tab].text.clone();
-        let dirty = self.tabs[self.active_tab].dirty;
-
-        // Each device call is scoped so the borrow ends before any error
-        // handling, which needs `&mut self` to resynchronise the connection.
-        if let (Some(remote), true) = (path.clone(), dirty) {
-            let saved = match self.device.as_mut() {
-                Some(d) => d.write_text_file(&remote, &text),
-                None => return,
-            };
-            if let Err(e) = saved {
-                self.fail_device_op("Failed to save before run", e);
-                return;
-            }
-            self.tabs[self.active_tab].dirty = false;
-        }
-
-        let result = match self.device.as_mut() {
-            Some(d) => match &path {
-                Some(remote) => d.run_file(remote),
-                None => d.run_snippet(&text),
-            },
-            None => return,
+        let tab = &self.tabs[self.active_tab];
+        let job = Job::RunScript {
+            path: tab.path.clone(),
+            text: tab.text.clone(),
+            save_first: tab.path.is_some() && tab.dirty,
         };
-
-        match result {
-            Ok(res) => {
-                self.last_status = Some(if res.stderr.trim().is_empty() {
-                    "Run finished".to_string()
-                } else {
-                    "Run raised an exception".to_string()
-                });
-                self.set_output(res);
-            }
-            Err(e) => self.fail_device_op("Execution error", e),
-        }
+        self.device_job(job);
     }
 
     /// Show a result in the output dock, opening it if it was collapsed.
     fn set_output(&mut self, res: ExecResult) {
         self.last_output = Some(res);
         self.output_open = true;
+        self.dock_tab = DockTab::Output;
+    }
+
+    /// Bring the REPL up and put the caret in it.
+    fn open_repl(&mut self) {
+        self.output_open = true;
+        self.dock_tab = DockTab::Repl;
+        self.repl.focus_input = true;
+    }
+
+    /// Send whatever is in the REPL input to the board.
+    fn submit_repl(&mut self) {
+        let source = self.repl.input.trim_end().to_string();
+        self.repl.input.clear();
+        self.repl.history_pos = None;
+        if source.trim().is_empty() {
+            return;
+        }
+        self.repl.remember(&source);
+        // Echo the entry immediately: the result arrives later, and a prompt
+        // that swallowed the line until then would feel broken.
+        self.repl.push(ReplEntry {
+            source: Some(source.clone()),
+            stdout: String::new(),
+            stderr: String::new(),
+            pending: true,
+        });
+        if !self.device_job(Job::RunRepl { source }) {
+            let why = self
+                .connection_error
+                .clone()
+                .unwrap_or_else(|| "No device connected".to_string());
+            self.settle_pending_repl(&why);
+        }
     }
 
     fn refresh_remote_tree(&mut self) {
-        self.ensure_connected();
-        let result = match self.device.as_mut() {
-            Some(d) => build_remote_tree(d, "/", 0, 4),
-            None => return,
-        };
-
-        match result {
-            Ok(nodes) => {
-                self.remote_tree = nodes;
-                self.last_status = Some("Refreshed device files".to_string());
-            }
-            Err(e) => {
-                self.remote_tree.clear();
-                self.fail_device_op("Failed to list device files", e);
-            }
-        }
+        self.device_job(Job::RefreshTree);
     }
 
     fn open_path(&mut self, path: String) {
-        self.ensure_connected();
-        let result = match self.device.as_mut() {
-            Some(d) => d.read_text_file(&path),
-            None => return,
-        };
-
-        match result {
-            Ok(text) => {
-                // Focus an existing tab for this path rather than duplicating.
-                if let Some(idx) = self
-                    .tabs
-                    .iter()
-                    .position(|t| t.path.as_deref() == Some(path.as_str()))
-                {
-                    self.tabs[idx].text = text;
-                    self.tabs[idx].dirty = false;
-                    self.active_tab = idx;
-                } else {
-                    // Reuse a pristine untitled tab instead of stacking up
-                    // empty buffers.
-                    let only_pristine_scratch = self.tabs.len() == 1
-                        && self.tabs[0].path.is_none()
-                        && !self.tabs[0].dirty
-                        && (self.tabs[0].text.is_empty() || self.tabs[0].text == STARTER_SNIPPET);
-                    if only_pristine_scratch {
-                        self.tabs.clear();
-                    }
-                    self.tabs.push(EditorTab::from_remote(path.clone(), text));
-                    self.active_tab = self.tabs.len() - 1;
-                }
-                self.connection_error = None;
-                self.last_status = Some(format!("Opened {path}"));
-            }
-            Err(e) => self.fail_device_op("Failed to open file", e),
-        }
+        self.device_job(Job::Open { path });
     }
 
     fn save_current(&mut self) {
-        self.ensure_connected();
-
         let path = match self.tabs[self.active_tab].path.clone() {
             Some(p) => p,
             None => {
@@ -872,96 +1668,216 @@ impl GuiApp {
                 return;
             }
         };
-
         let text = self.tabs[self.active_tab].text.clone();
-        let result = match self.device.as_mut() {
-            Some(d) => d.write_text_file(&path, &text),
-            None => return,
-        };
-
-        match result {
-            Ok(()) => {
-                self.tabs[self.active_tab].dirty = false;
-                self.connection_error = None;
-                self.last_status = Some(format!("Saved {path}"));
-            }
-            Err(e) => self.fail_device_op("Failed to save file", e),
-        }
+        self.device_job(Job::Save { path, text });
     }
 
     fn create_file(&mut self, path: String) {
-        self.ensure_connected();
-        let result = match self.device.as_mut() {
-            Some(d) => d.write_text_file(&path, ""),
-            None => return,
-        };
+        self.device_job(Job::Create { path });
+    }
 
-        match result {
-            Ok(()) => {
-                self.connection_error = None;
-                self.last_status = Some(format!("Created {path}"));
-                self.refresh_remote_tree();
-                self.tabs.push(EditorTab::from_remote(path, String::new()));
-                self.active_tab = self.tabs.len() - 1;
-            }
-            Err(e) => self.fail_device_op("Failed to create file", e),
+    fn delete_path(&mut self, path: &str, is_dir: bool, recursive: bool) {
+        self.device_job(Job::Delete {
+            path: path.to_string(),
+            is_dir,
+            recursive,
+        });
+    }
+
+    fn rename_path(&mut self, old_path: &str, new_path: &str) {
+        self.device_job(Job::Rename {
+            old: old_path.to_string(),
+            new: new_path.to_string(),
+        });
+    }
+
+    /// Apply everything the device thread has reported since the last frame.
+    fn poll_device(&mut self) {
+        while let Ok(update) = self.link.updates.try_recv() {
+            self.apply_update(update);
         }
     }
 
-    fn delete_path(&mut self, path: &str, is_dir: bool) {
-        self.ensure_connected();
-        let res = match self.device.as_mut() {
-            Some(d) => {
-                if is_dir {
-                    d.rmdir(path)
-                } else {
-                    d.remove(path)
-                }
+    fn apply_update(&mut self, update: Update) {
+        match update {
+            Update::Started(label, kind) => self.busy = Some((label, kind)),
+            Update::Finished => self.busy = None,
+            Update::Connected(port) => {
+                self.connected = true;
+                self.connecting = false;
+                self.connection_error = None;
+                self.last_status = Some(format!("Connected to {}", short_port(&port)));
             }
-            None => return,
-        };
-
-        match res {
-            Ok(()) => {
+            Update::Disconnected => {
+                self.connected = false;
+                self.connecting = false;
+                self.remote_tree.clear();
+                self.last_status = Some("Disconnected".to_string());
+            }
+            Update::Tree(nodes) => self.remote_tree = nodes,
+            Update::Opened { path, text } => {
+                self.adopt_opened_file(path, text);
+            }
+            Update::Saved { path } => {
+                for tab in &mut self.tabs {
+                    if tab.path.as_deref() == Some(path.as_str()) {
+                        tab.dirty = false;
+                    }
+                }
+                self.connection_error = None;
+                self.last_status = Some(format!("Saved {path}"));
+            }
+            Update::Created { path } => {
+                self.connection_error = None;
+                self.last_status = Some(format!("Created {path}"));
+                self.tabs.push(EditorTab::from_remote(path, String::new()));
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Update::Deleted { path } => {
                 self.last_status = Some(format!("Deleted {path}"));
                 // Keep the buffer but unbind it: the file is gone, and its
                 // contents may be the only surviving copy.
                 for tab in &mut self.tabs {
-                    if tab.path.as_deref() == Some(path) {
+                    if tab.path.as_deref() == Some(path.as_str()) {
                         tab.path = None;
                         tab.dirty = true;
                     }
                 }
-                if self.selected_remote_path.as_deref() == Some(path) {
+                if self.selected_remote_path.as_deref() == Some(path.as_str()) {
                     self.selected_remote_path = None;
                 }
-                self.refresh_remote_tree();
             }
-            Err(e) => self.fail_device_op(&format!("Failed to delete {path}"), e),
+            Update::Renamed { old, new } => {
+                self.last_status = Some(format!("Renamed to {new}"));
+                for tab in &mut self.tabs {
+                    if tab.path.as_deref() == Some(old.as_str()) {
+                        tab.path = Some(new.clone());
+                    }
+                }
+                if self.selected_remote_path.as_deref() == Some(old.as_str()) {
+                    self.selected_remote_path = Some(new);
+                }
+            }
+            Update::Output(res) => self.set_output(res),
+            Update::Repl {
+                source,
+                stdout,
+                stderr,
+            } => self.settle_repl_entry(&source, stdout, stderr),
+            Update::Status(text) => self.last_status = Some(text),
+            Update::SyncProgress(action) => self.sync_panel.live.push(action),
+            Update::SyncDone {
+                outcome,
+                preview,
+                from_device,
+            } => {
+                let copied = outcome.count(if from_device { "download" } else { "upload" });
+                let deleted = outcome.count("delete_remote_file")
+                    + outcome.count("delete_remote_dir")
+                    + outcome.count("delete_local_file")
+                    + outcome.count("delete_local_dir");
+                self.last_status = Some(if outcome.cancelled {
+                    format!("Sync cancelled after {copied} copied, {deleted} deleted")
+                } else if preview {
+                    format!("Preview: {copied} to copy, {deleted} to delete")
+                } else {
+                    format!("Synced: {copied} copied, {deleted} deleted")
+                });
+                self.sync_panel.last_was_preview = preview;
+                self.sync_panel.last = Some(*outcome);
+                self.sync_panel.live.clear();
+                self.connection_error = None;
+                self.save_prefs();
+            }
+            Update::Notice(text) => {
+                // The board said something without raising. Keep it where a
+                // session's other output lives rather than dropping it.
+                self.repl.push(ReplEntry {
+                    source: None,
+                    stdout: format!("device: {text}"),
+                    stderr: String::new(),
+                    pending: false,
+                });
+                self.last_status = Some(format!("Device: {text}"));
+            }
+            Update::Failed {
+                what,
+                message,
+                connected,
+            } => {
+                self.connection_error = Some(format!("{what}: {message}"));
+                self.connected = connected;
+                self.connecting = false;
+                if !connected {
+                    self.remote_tree.clear();
+                }
+                self.last_status = Some(if connected {
+                    format!("{what} (connection resynchronised)")
+                } else {
+                    format!("{what} (disconnected)")
+                });
+                // A REPL entry still waiting on the board would otherwise sit
+                // there marked pending for ever.
+                self.settle_pending_repl(&message);
+            }
         }
     }
 
-    fn rename_path(&mut self, old_path: &str, new_path: &str) {
-        self.ensure_connected();
-        let result = match self.device.as_mut() {
-            Some(d) => d.rename(old_path, new_path),
-            None => return,
-        };
-
-        match result {
-            Ok(()) => {
-                self.last_status = Some(format!("Renamed to {new_path}"));
-                for tab in &mut self.tabs {
-                    if tab.path.as_deref() == Some(old_path) {
-                        tab.path = Some(new_path.to_string());
-                    }
-                }
-                if self.selected_remote_path.as_deref() == Some(old_path) {
-                    self.selected_remote_path = Some(new_path.to_string());
-                }
-                self.refresh_remote_tree();
+    /// Put an opened file in front of the user.
+    fn adopt_opened_file(&mut self, path: String, text: String) {
+        // Focus an existing tab for this path rather than duplicating.
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.path.as_deref() == Some(path.as_str()))
+        {
+            self.tabs[idx].text = text;
+            self.tabs[idx].dirty = false;
+            self.active_tab = idx;
+        } else {
+            // Reuse a pristine untitled tab instead of stacking up empty
+            // buffers.
+            let only_pristine_scratch = self.tabs.len() == 1
+                && self.tabs[0].path.is_none()
+                && !self.tabs[0].dirty
+                && (self.tabs[0].text.is_empty() || self.tabs[0].text == STARTER_SNIPPET);
+            if only_pristine_scratch {
+                self.tabs.clear();
             }
-            Err(e) => self.fail_device_op(&format!("Failed to rename {old_path}"), e),
+            self.tabs.push(EditorTab::from_remote(path.clone(), text));
+            self.active_tab = self.tabs.len() - 1;
+        }
+        self.connection_error = None;
+        self.last_status = Some(format!("Opened {path}"));
+    }
+
+    /// Fill in the result of the REPL entry that was waiting for it.
+    fn settle_repl_entry(&mut self, source: &str, stdout: String, stderr: String) {
+        self.last_status = Some(if stderr.trim().is_empty() {
+            "REPL entry finished".to_string()
+        } else {
+            "REPL entry raised an exception".to_string()
+        });
+        if let Some(entry) = self
+            .repl
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.pending && e.source.as_deref() == Some(source))
+        {
+            entry.stdout = stdout;
+            entry.stderr = stderr;
+            entry.pending = false;
+        }
+    }
+
+    /// Close off any REPL entry left waiting when something went wrong.
+    fn settle_pending_repl(&mut self, message: &str) {
+        for entry in self.repl.entries.iter_mut().filter(|e| e.pending) {
+            entry.pending = false;
+            if entry.stderr.trim().is_empty() {
+                entry.stderr = message.to_string();
+            }
         }
     }
 }
@@ -973,20 +1889,24 @@ impl GuiApp {
 impl GuiApp {
     /// Keyboard shortcuts, consumed before any widget can swallow the key.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, run, close_tab, toggle_output, new_tab) = ctx.input_mut(|i| {
+        let (save, run, close_tab, toggle_output, new_tab, repl) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::R),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::W),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::J),
                 i.consume_key(egui::Modifiers::COMMAND, egui::Key::N),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::L),
             )
         });
 
-        if save {
+        // The device shortcuts mirror the toolbar buttons, including being
+        // unavailable while a job is in flight.
+        let idle = self.busy.is_none();
+        if save && idle {
             self.save_current();
         }
-        if run {
+        if run && idle {
             self.run_current_script();
         }
         if close_tab {
@@ -998,6 +1918,9 @@ impl GuiApp {
         if new_tab {
             self.tabs.push(EditorTab::untitled());
             self.active_tab = self.tabs.len() - 1;
+        }
+        if repl {
+            self.open_repl();
         }
     }
 
@@ -1013,10 +1936,13 @@ impl GuiApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        // A job already in flight disables the buttons that would queue
+        // another one — except Stop, which exists precisely for then.
+        let idle = self.busy.is_none();
         ui.horizontal(|ui| {
             // Colour carries the connection state, so it reads without
             // parsing any text.
-            let (dot, tint) = if self.device.is_some() {
+            let (dot, tint) = if self.connected {
                 (sym::CONNECTED_DOT, pal.ok)
             } else {
                 (sym::DISCONNECTED_DOT, pal.dim)
@@ -1057,17 +1983,23 @@ impl GuiApp {
                     }
                 });
 
-            if self.device.is_some() {
-                if ui.button("Disconnect").clicked() {
+            if self.connected {
+                if ui
+                    .add_enabled(idle, egui::Button::new("Disconnect"))
+                    .clicked()
+                {
                     self.disconnect();
                 }
-            } else if ui.button("Connect").clicked() {
+            } else if ui
+                .add_enabled(idle && !self.connecting, egui::Button::new("Connect"))
+                .clicked()
+            {
                 self.connect_and_list();
             }
 
             ui.separator();
 
-            let usable = self.device.is_some() || self.selected_port.is_some();
+            let usable = (self.connected || self.selected_port.is_some()) && idle;
             if ui
                 .add_enabled(usable, egui::Button::new(sym::RUN))
                 .on_hover_text("Run the active tab on the device   ⌘R")
@@ -1076,7 +2008,7 @@ impl GuiApp {
                 self.run_current_script();
             }
             if ui
-                .add_enabled(usable, egui::Button::new(sym::STOP))
+                .add_enabled(self.connected, egui::Button::new(sym::STOP))
                 .on_hover_text("Interrupt whatever is running on the device")
                 .clicked()
             {
@@ -1099,6 +2031,13 @@ impl GuiApp {
 
             ui.separator();
 
+            if ui
+                .add_enabled(usable, egui::Button::new(sym::REPL))
+                .on_hover_text("Type Python straight at the board   ⌘L")
+                .clicked()
+            {
+                self.open_repl();
+            }
             if ui
                 .add_enabled(usable, egui::Button::new(sym::SYNC))
                 .on_hover_text("Mirror a local folder to or from the device")
@@ -1137,7 +2076,7 @@ impl GuiApp {
                 {
                     self.refresh_remote_tree();
                 }
-                let can_add = self.device.is_some();
+                let can_add = self.connected;
                 if ui
                     .add_enabled(can_add, egui::Button::new(sym::ADD).small())
                     .on_hover_text("New file at the device root")
@@ -1153,7 +2092,7 @@ impl GuiApp {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new(if self.device.is_some() {
+                    egui::RichText::new(if self.connected {
                         "No files on device"
                     } else {
                         "Not connected"
@@ -1161,7 +2100,7 @@ impl GuiApp {
                     .color(pal.dim),
                 );
                 ui.add_space(6.0);
-                if self.device.is_none() && ui.button("Connect").clicked() {
+                if !self.connected && ui.button("Connect").clicked() {
                     self.connect_and_list();
                 }
             });
@@ -1207,7 +2146,9 @@ impl GuiApp {
                     self.creating = None;
                     self.renaming = Some((path, leaf));
                 }
-                TreeAction::Delete(path, is_dir) => self.confirm_delete = Some((path, is_dir)),
+                TreeAction::Delete(path, is_dir) => {
+                    self.confirm_delete = Some((path, is_dir, false))
+                }
                 TreeAction::NewFileIn(dir) => {
                     self.renaming = None;
                     self.creating = Some((dir, String::new()));
@@ -1336,50 +2277,73 @@ impl GuiApp {
             });
     }
 
-    fn output_dock(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+    /// The bottom dock: a tab strip over the output transcript and the REPL.
+    fn dock(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let has_err = self
             .last_output
             .as_ref()
             .is_some_and(|o| !o.stderr.trim().is_empty());
+        let on_repl = self.dock_tab == DockTab::Repl;
 
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("OUTPUT")
-                    .small()
-                    .strong()
-                    .color(pal.dim),
-            );
-            ui.add_space(4.0);
-            ui.selectable_value(&mut self.output_filter, OutputFilter::All, "All");
-            ui.selectable_value(&mut self.output_filter, OutputFilter::Stdout, "stdout");
-            let stderr_label = if has_err {
-                egui::RichText::new("stderr").color(pal.err)
-            } else {
-                egui::RichText::new("stderr")
+            let repl_clicked = {
+                ui.selectable_value(&mut self.dock_tab, DockTab::Output, "Output");
+                ui.selectable_value(&mut self.dock_tab, DockTab::Repl, sym::REPL)
+                    .clicked()
             };
-            ui.selectable_value(&mut self.output_filter, OutputFilter::Stderr, stderr_label);
+            // Switching to the REPL by hand should leave the caret ready, the
+            // same as arriving there by shortcut.
+            if repl_clicked {
+                self.repl.focus_input = true;
+            }
+
+            if !on_repl {
+                ui.add_space(4.0);
+                ui.selectable_value(&mut self.output_filter, OutputFilter::All, "All");
+                ui.selectable_value(&mut self.output_filter, OutputFilter::Stdout, "stdout");
+                let stderr_label = if has_err {
+                    egui::RichText::new("stderr").color(pal.err)
+                } else {
+                    egui::RichText::new("stderr")
+                };
+                ui.selectable_value(&mut self.output_filter, OutputFilter::Stderr, stderr_label);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Words, not symbols: egui's default font has no glyph for
                 // ⌫ / ⌄ / ⌃, so those drew as empty boxes.
                 if ui
                     .small_button("Hide")
-                    .on_hover_text("Hide the output dock   ⌘J")
+                    .on_hover_text("Hide the dock   ⌘J")
                     .clicked()
                 {
                     self.output_open = false;
                 }
-                if ui
-                    .small_button("Clear")
-                    .on_hover_text("Clear the output")
-                    .clicked()
-                {
-                    self.last_output = None;
+                let clear = if on_repl {
+                    ui.small_button("Clear")
+                        .on_hover_text("Clear the REPL transcript (history is kept)")
+                } else {
+                    ui.small_button("Clear").on_hover_text("Clear the output")
+                };
+                if clear.clicked() {
+                    if on_repl {
+                        self.repl.entries.clear();
+                    } else {
+                        self.last_output = None;
+                    }
                 }
             });
         });
         ui.separator();
 
+        match self.dock_tab {
+            DockTab::Output => self.output_view(ui, pal),
+            DockTab::Repl => self.repl_view(ui, pal),
+        }
+    }
+
+    /// Transcript of the last run.
+    fn output_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         egui::ScrollArea::both()
             .id_salt("output_scroll")
             .auto_shrink([false, false])
@@ -1417,9 +2381,129 @@ impl GuiApp {
             });
     }
 
+    /// The REPL: a transcript above, a prompt pinned to the bottom.
+    fn repl_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        // The prompt is a panel inside the dock so it keeps its place while
+        // the transcript takes whatever height is left.
+        egui::Panel::bottom("repl_prompt")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 4)))
+            .show(ui, |ui| self.repl_prompt(ui, pal));
+
+        egui::ScrollArea::both()
+            .id_salt("repl_scroll")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.repl.entries.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Type Python and press Enter to run it on the board. \
+                             Shift-Enter for a new line, Up and Down for history.",
+                        )
+                        .color(pal.dim),
+                    );
+                    return;
+                }
+
+                for entry in &self.repl.entries {
+                    if let Some(source) = &entry.source {
+                        ui.label(
+                            egui::RichText::new(prompt_block(source))
+                                .font(code_font())
+                                .color(pal.accent),
+                        );
+                    }
+                    if entry.pending {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(10.0));
+                            ui.label(
+                                egui::RichText::new("running on the board")
+                                    .font(code_font())
+                                    .color(pal.dim),
+                            );
+                        });
+                    }
+                    if !entry.stdout.trim().is_empty() {
+                        ui.label(
+                            egui::RichText::new(entry.stdout.trim_end())
+                                .font(code_font())
+                                .color(pal.ident),
+                        );
+                    }
+                    if !entry.stderr.trim().is_empty() {
+                        ui.label(
+                            egui::RichText::new(entry.stderr.trim_end())
+                                .font(code_font())
+                                .color(pal.err),
+                        );
+                    }
+                    ui.add_space(3.0);
+                }
+            });
+    }
+
+    /// The input line, and the keys that only mean something while it has
+    /// focus.
+    fn repl_prompt(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let id = ReplPanel::input_id();
+        let focused = ui.ctx().memory(|m| m.has_focus(id));
+        // A multi-line entry needs the arrow keys for the caret, so history
+        // recall only claims them while the buffer is a single line.
+        let one_line = !self.repl.input.contains('\n');
+
+        // Claimed before the field is built, so the text edit never sees them:
+        // otherwise Enter would insert a newline as well as submitting.
+        let (submit, older, newer) = if focused {
+            ui.ctx().input_mut(|i| {
+                (
+                    take_bare_key(i, egui::Key::Enter),
+                    one_line && take_bare_key(i, egui::Key::ArrowUp),
+                    one_line && take_bare_key(i, egui::Key::ArrowDown),
+                )
+            })
+        } else {
+            (false, false, false)
+        };
+
+        if older {
+            self.repl.recall_older();
+        }
+        if newer {
+            self.repl.recall_newer();
+        }
+
+        ui.horizontal_top(|ui| {
+            ui.label(
+                egui::RichText::new(">>>")
+                    .font(code_font())
+                    .color(pal.accent),
+            );
+            let field = egui::TextEdit::multiline(&mut self.repl.input)
+                .id(id)
+                .font(code_font())
+                .desired_rows(1)
+                .lock_focus(true)
+                .desired_width(f32::INFINITY)
+                .hint_text("print('hello')");
+            let response = ui.add(field);
+            if self.repl.focus_input {
+                response.request_focus();
+                self.repl.focus_input = false;
+            }
+        });
+
+        if submit {
+            self.submit_repl();
+            // Submitting should not cost the caret; the next entry usually
+            // follows straight on.
+            self.repl.focus_input = true;
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.horizontal(|ui| {
-            let (dot, tint, state) = if self.device.is_some() {
+            let (dot, tint, state) = if self.connected {
                 (sym::CONNECTED_DOT, pal.ok, "Connected")
             } else {
                 (sym::DISCONNECTED_DOT, pal.dim, "Disconnected")
@@ -1446,7 +2530,25 @@ impl GuiApp {
                 {
                     self.output_open = true;
                 }
-                if let Some(msg) = &self.last_status {
+                // While the device thread is busy the window keeps drawing,
+                // so it has to say what it is waiting for — and offer the way
+                // out that suits the job.
+                if let Some((label, kind)) = self.busy.clone() {
+                    let stoppable = matches!(kind, JobKind::Exec | JobKind::Cancellable);
+                    if stoppable
+                        && ui
+                            .small_button("Cancel")
+                            .on_hover_text(match kind {
+                                JobKind::Exec => "Interrupt the program on the board",
+                                _ => "Stop after the current file",
+                            })
+                            .clicked()
+                    {
+                        self.cancel_current();
+                    }
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(egui::RichText::new(label).color(pal.accent).small());
+                } else if let Some(msg) = &self.last_status {
                     ui.label(egui::RichText::new(msg).color(pal.dim).small());
                 }
             });
@@ -1483,6 +2585,8 @@ impl GuiApp {
         Prefs {
             sync_local_dir: self.sync_panel.local_dir.clone(),
             sync_remote_dir: Some(self.sync_panel.remote_dir.clone()),
+            sync_skip_hidden: self.sync_panel.skip_hidden,
+            sync_skip_markdown: self.sync_panel.skip_markdown,
             last_port: self.selected_port.clone(),
         }
         .save();
@@ -1503,51 +2607,29 @@ impl GuiApp {
             return;
         }
 
-        self.ensure_connected();
         let opts = sync::SyncOptions {
             delete: self.sync_panel.delete,
             dry_run: preview,
-            ignore: Vec::new(),
+            ignore: self.sync_panel.ignore_patterns(),
             // The panel keeps no last-sync baseline, so there is nothing to
             // detect conflicts against and every copy is unconditional. The
             // CLI's workspace `sync` is the mode that tracks conflicts.
             force: true,
-        };
-        let from_device = self.sync_panel.from_device;
-
-        let result = match self.device.as_mut() {
-            Some(dev) => {
-                if from_device {
-                    sync::from_device(dev, &remote, &local, &opts, None, None)
-                } else {
-                    sync::to_device(dev, &local, &remote, &opts, None, None)
-                }
-            }
-            None => return,
+            // Shared with the worker so Cancel can stop a long sync between
+            // files instead of the window sitting there until it ends.
+            cancel: Some(Arc::clone(&self.link.cancel)),
         };
 
-        match result {
-            Ok(outcome) => {
-                let copied = outcome.count(if from_device { "download" } else { "upload" });
-                let deleted = outcome.count("delete_remote_file")
-                    + outcome.count("delete_remote_dir")
-                    + outcome.count("delete_local_file")
-                    + outcome.count("delete_local_dir");
-                self.last_status = Some(if preview {
-                    format!("Preview: {copied} to copy, {deleted} to delete")
-                } else {
-                    format!("Synced: {copied} copied, {deleted} deleted")
-                });
-                self.sync_panel.last_was_preview = preview;
-                self.sync_panel.last = Some(outcome);
-                self.connection_error = None;
-                if !preview {
-                    self.refresh_remote_tree();
-                }
-                self.save_prefs();
-            }
-            Err(e) => self.fail_device_op("Sync failed", e),
-        }
+        self.sync_panel.live.clear();
+        self.sync_panel.last = None;
+        let job = Job::Sync {
+            local,
+            remote,
+            opts,
+            from_device: self.sync_panel.from_device,
+            preview,
+        };
+        self.device_job(job);
     }
 
     fn sync_window(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -1615,11 +2697,32 @@ impl GuiApp {
                     &mut self.sync_panel.delete,
                     "Delete files on the destination that are not on the source",
                 );
+                if ui
+                    .checkbox(
+                        &mut self.sync_panel.skip_hidden,
+                        "Skip files and folders starting with a dot",
+                    )
+                    .on_hover_text("Excludes .git, .vscode, .DS_Store and the like")
+                    .changed()
+                {
+                    self.sync_panel.last = None;
+                    self.save_prefs();
+                }
+                if ui
+                    .checkbox(&mut self.sync_panel.skip_markdown, "Skip Markdown files")
+                    .on_hover_text("Excludes README.md and other .md documentation")
+                    .changed()
+                {
+                    self.sync_panel.last = None;
+                    self.save_prefs();
+                }
                 ui.add_space(8.0);
 
                 // --- actions ---------------------------------------------
+                let syncing = matches!(self.busy, Some((_, JobKind::Cancellable)));
                 let ready = self.sync_panel.local_dir.is_some()
-                    && !self.sync_panel.remote_dir.trim().is_empty();
+                    && !self.sync_panel.remote_dir.trim().is_empty()
+                    && !syncing;
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(ready, egui::Button::new("Preview"))
@@ -1639,12 +2742,47 @@ impl GuiApp {
                     {
                         self.run_sync(false);
                     }
+                    if syncing {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        if ui.button("Stop").clicked() {
+                            self.cancel_current();
+                        }
+                    }
                 });
 
                 ui.add_space(8.0);
                 ui.separator();
 
                 // --- results ---------------------------------------------
+                // A sync in flight reports each decision as it makes it, so
+                // the window shows the work rather than a frozen pane.
+                if syncing {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} decisions so far",
+                            self.sync_panel.live.len()
+                        ))
+                        .small()
+                        .strong()
+                        .color(pal.accent),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("sync_live")
+                        .max_height(220.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for action in &self.sync_panel.live {
+                                ui.label(
+                                    egui::RichText::new(sync_action_line(action))
+                                        .font(code_font())
+                                        .color(pal.dim),
+                                );
+                            }
+                        });
+                    return;
+                }
+
                 let Some(outcome) = &self.sync_panel.last else {
                     ui.add_space(8.0);
                     let hint = if ready {
@@ -2003,35 +3141,6 @@ fn show_node(
     }
 }
 
-fn build_remote_tree(
-    dev: &mut MicroPythonDevice,
-    path: &str,
-    depth: usize,
-    max_depth: usize,
-) -> MpResult<Vec<RemoteNode>> {
-    let mut nodes = Vec::new();
-    let entries = dev.list_dir(path)?;
-
-    for e in entries {
-        let full = join_remote_path(path, &e.name);
-        let children = if e.is_dir && depth < max_depth {
-            build_remote_tree(dev, &full, depth + 1, max_depth)?
-        } else {
-            Vec::new()
-        };
-        nodes.push(RemoteNode {
-            name: e.name,
-            path: full,
-            is_dir: e.is_dir,
-            children,
-        });
-    }
-
-    // Directories first, then files, each alphabetically.
-    nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    Ok(nodes)
-}
-
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2044,6 +3153,9 @@ impl eframe::App for GuiApp {
             self.tabs.push(EditorTab::untitled());
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+
+        // Everything the device thread has done since the last frame.
+        self.poll_device();
 
         self.handle_shortcuts(&ctx);
 
@@ -2090,7 +3202,7 @@ impl eframe::App for GuiApp {
                 .resizable(true)
                 .default_size(170.0)
                 .frame(rail_frame(&pal))
-                .show(ui, |ui| self.output_dock(ui, &pal));
+                .show(ui, |ui| self.dock(ui, &pal));
         }
 
         egui::Panel::left("files")
@@ -2124,7 +3236,7 @@ impl eframe::App for GuiApp {
             self.update_window(&ctx, &pal);
         }
 
-        if let Some((path, is_dir)) = self.confirm_delete.clone() {
+        if let Some((path, is_dir, recursive)) = self.confirm_delete.clone() {
             let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(&ctx, |ui| {
                 ui.set_width(330.0);
                 ui.heading("Delete from device?");
@@ -2133,12 +3245,22 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(if is_dir {
-                        "The directory must already be empty."
+                        "An empty directory unless you delete its contents too."
                     } else {
                         "This cannot be undone."
                     })
                     .color(pal.dim),
                 );
+                if is_dir {
+                    ui.add_space(6.0);
+                    let mut recurse = recursive;
+                    if ui
+                        .checkbox(&mut recurse, "Delete everything inside it")
+                        .changed()
+                    {
+                        self.confirm_delete = Some((path.clone(), is_dir, recurse));
+                    }
+                }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -2151,7 +3273,7 @@ impl eframe::App for GuiApp {
                         .fill(pal.err);
                         if ui.add(danger).clicked() {
                             self.confirm_delete = None;
-                            self.delete_path(&path, is_dir);
+                            self.delete_path(&path, is_dir, recursive);
                         }
                     });
                 });
@@ -2175,13 +3297,60 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rupico",
         options,
-        Box::new(|_cc| Ok(Box::new(GuiApp::default()))),
+        Box::new(|cc| Ok(Box::new(GuiApp::new(&cc.egui_ctx)))),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_checkboxes_exclude_only_what_they_name() {
+        use rupico::sync::path_is_ignored;
+        use std::path::Path;
+
+        let mut panel = SyncPanel {
+            skip_hidden: true,
+            skip_markdown: true,
+            ..SyncPanel::default()
+        };
+        let pats = panel.ignore_patterns();
+
+        // Dotted names, at the root and nested, files and directories.
+        assert!(path_is_ignored(Path::new(".DS_Store"), &pats));
+        assert!(path_is_ignored(Path::new(".vscode"), &pats));
+        assert!(path_is_ignored(Path::new(".vscode/settings.json"), &pats));
+        assert!(path_is_ignored(Path::new("lib/.cache/x.py"), &pats));
+        assert!(path_is_ignored(Path::new("README.md"), &pats));
+        assert!(path_is_ignored(Path::new("docs/guide.md"), &pats));
+
+        // A dot inside a name is not a dot at the start of one, and `.md`
+        // must not match a file that merely contains those letters.
+        assert!(!path_is_ignored(Path::new("main.py"), &pats));
+        assert!(!path_is_ignored(Path::new("my.config.py"), &pats));
+        assert!(!path_is_ignored(Path::new("lib/weather.py"), &pats));
+        assert!(!path_is_ignored(Path::new("md.py"), &pats));
+        assert!(!path_is_ignored(Path::new("notes.markdown"), &pats));
+
+        // Each checkbox acts alone.
+        panel.skip_markdown = false;
+        let hidden_only = panel.ignore_patterns();
+        assert!(path_is_ignored(Path::new(".env"), &hidden_only));
+        assert!(!path_is_ignored(Path::new("README.md"), &hidden_only));
+
+        panel.skip_hidden = false;
+        panel.skip_markdown = true;
+        let md_only = panel.ignore_patterns();
+        assert!(path_is_ignored(Path::new("README.md"), &md_only));
+        assert!(!path_is_ignored(Path::new(".env"), &md_only));
+    }
+
+    #[test]
+    fn no_skip_options_means_no_extra_patterns() {
+        // Both off must leave the engine's built-ins exactly as they were.
+        assert!(SyncPanel::default().ignore_patterns().is_empty());
+    }
 
     /// Decompose a highlighted job into `(text, colour)` runs so assertions
     /// can talk about what was coloured rather than about layout internals.
@@ -2345,6 +3514,313 @@ mod tests {
         let pal = Palette::for_theme(true);
         assert_eq!(color_of("# def not code", "# def not code"), pal.comment);
         assert_eq!(color_of("s = 'return me'", "'return me'"), pal.string);
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn only_a_bare_keypress_is_claimed_from_the_repl_input() {
+        // Regression: `consume_key(Modifiers::NONE, ..)` matches modifiers
+        // *logically*, which ignores Shift — so Shift-Enter submitted the
+        // entry instead of breaking the line, and never reached the field.
+        let mut input = egui::InputState::default();
+        input.events = vec![
+            key_event(egui::Key::Enter, egui::Modifiers::SHIFT),
+            key_event(egui::Key::ArrowUp, egui::Modifiers::SHIFT),
+        ];
+        assert!(!take_bare_key(&mut input, egui::Key::Enter));
+        assert!(!take_bare_key(&mut input, egui::Key::ArrowUp));
+        assert_eq!(input.events.len(), 2, "modified keys stay for the field");
+
+        input.events = vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)];
+        assert!(take_bare_key(&mut input, egui::Key::Enter));
+        assert!(
+            input.events.is_empty(),
+            "a claimed key must not reach the field"
+        );
+    }
+
+    fn tree_entry(path: &str, is_dir: bool) -> micropython::RemoteTreeEntry {
+        serde_json::from_value(serde_json::json!({
+            "p": path, "d": is_dir, "s": 0, "h": null
+        }))
+        .expect("entry parses")
+    }
+
+    #[test]
+    fn the_file_rail_is_built_from_one_flat_walk() {
+        // The rail used to cost a `list_dir` round trip per directory. It now
+        // shares the single-round-trip walk, so the flat result has to be
+        // regrouped into the tree the rail draws.
+        let entries = vec![
+            tree_entry("main.py", false),
+            tree_entry("lib", true),
+            tree_entry("lib/mod.py", false),
+            tree_entry("lib/deep", true),
+            tree_entry("lib/deep/x.py", false),
+        ];
+        let tree = tree_from_entries(&entries, "/");
+
+        // Directories first, then files, each alphabetically.
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].name, "lib");
+        assert!(tree[0].is_dir);
+        assert_eq!(tree[1].name, "main.py");
+        assert_eq!(tree[1].path, "/main.py");
+
+        let lib = &tree[0];
+        assert_eq!(lib.children.len(), 2, "one flat walk, all depths");
+        assert_eq!(lib.children[0].name, "deep");
+        assert_eq!(lib.children[0].children[0].path, "/lib/deep/x.py");
+        assert_eq!(lib.children[1].path, "/lib/mod.py");
+    }
+
+    #[test]
+    fn tree_paths_hang_off_the_root_they_were_walked_from() {
+        let tree = tree_from_entries(&[tree_entry("mod.py", false)], "/lib");
+        assert_eq!(tree[0].path, "/lib/mod.py");
+    }
+
+    #[test]
+    fn only_board_side_work_is_stopped_with_ctrl_c() {
+        // Cancelling has to mean different things: a program on the board
+        // only stops for Ctrl-C, while a sync can be asked to stop between
+        // files, and a one-shot listing is not worth interrupting at all.
+        assert_eq!(Job::RunRepl { source: "x".into() }.kind(), JobKind::Exec);
+        assert_eq!(
+            Job::RunScript {
+                path: None,
+                text: String::new(),
+                save_first: false
+            }
+            .kind(),
+            JobKind::Exec
+        );
+        assert_eq!(Job::RunMain.kind(), JobKind::Exec);
+        assert_eq!(
+            Job::Sync {
+                local: PathBuf::from("/tmp"),
+                remote: "/".into(),
+                opts: sync::SyncOptions::default(),
+                from_device: false,
+                preview: false,
+            }
+            .kind(),
+            JobKind::Cancellable
+        );
+        assert_eq!(Job::RefreshTree.kind(), JobKind::Quick);
+    }
+
+    /// An app instance with a device thread that will never be given work.
+    fn headless_app() -> GuiApp {
+        GuiApp::new(&egui::Context::default())
+    }
+
+    #[test]
+    fn a_failure_never_leaves_a_repl_entry_waiting_for_ever() {
+        // The prompt echoes an entry the moment it is submitted, so anything
+        // that stops its result from arriving has to close the entry off.
+        let mut app = headless_app();
+        app.repl.push(ReplEntry {
+            source: Some("machine.freq()".to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+            pending: true,
+        });
+
+        app.apply_update(Update::Failed {
+            what: "REPL error".to_string(),
+            message: "execution timed out".to_string(),
+            connected: false,
+        });
+
+        let entry = app.repl.entries.last().expect("the entry is still there");
+        assert!(!entry.pending, "no entry may stay pending after a failure");
+        assert_eq!(entry.stderr, "execution timed out");
+        assert!(!app.connected, "a dropped connection shows as disconnected");
+        assert!(app.remote_tree.is_empty(), "a stale tree is not kept");
+    }
+
+    #[test]
+    fn a_result_fills_in_the_entry_that_was_waiting_for_it() {
+        let mut app = headless_app();
+        app.repl.push(ReplEntry {
+            source: Some("6 * 7".to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+            pending: true,
+        });
+
+        app.apply_update(Update::Repl {
+            source: "6 * 7".to_string(),
+            stdout: "42\n".to_string(),
+            stderr: String::new(),
+        });
+
+        let entry = app.repl.entries.last().expect("entry");
+        assert!(!entry.pending);
+        assert_eq!(entry.stdout, "42\n");
+        assert_eq!(
+            app.repl.entries.len(),
+            1,
+            "the echo is filled in, not duplicated"
+        );
+    }
+
+    #[test]
+    fn an_opened_file_reuses_its_tab_rather_than_stacking_up_copies() {
+        let mut app = headless_app();
+        // The starter buffer is scratch, so the first opened file takes it.
+        app.apply_update(Update::Opened {
+            path: "/main.py".to_string(),
+            text: "print(1)\n".to_string(),
+        });
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].path.as_deref(), Some("/main.py"));
+
+        app.apply_update(Update::Opened {
+            path: "/lib/mod.py".to_string(),
+            text: "X = 1\n".to_string(),
+        });
+        assert_eq!(app.tabs.len(), 2);
+
+        // Opening the same file again refreshes its tab instead of adding one.
+        app.apply_update(Update::Opened {
+            path: "/main.py".to_string(),
+            text: "print(2)\n".to_string(),
+        });
+        assert_eq!(app.tabs.len(), 2, "no duplicate tab for the same path");
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.tabs[0].text, "print(2)\n");
+        assert!(!app.tabs[0].dirty, "a freshly loaded buffer is clean");
+    }
+
+    #[test]
+    fn a_deleted_file_keeps_its_buffer_but_loses_its_path() {
+        // The device copy is gone, so the open buffer may be the only one
+        // left; it must not be silently re-saveable to a file that no longer
+        // exists either.
+        let mut app = headless_app();
+        app.apply_update(Update::Opened {
+            path: "/doomed.py".to_string(),
+            text: "keep me".to_string(),
+        });
+
+        app.apply_update(Update::Deleted {
+            path: "/doomed.py".to_string(),
+        });
+
+        assert_eq!(app.tabs[0].text, "keep me");
+        assert_eq!(app.tabs[0].path, None);
+        assert!(app.tabs[0].dirty);
+    }
+
+    #[test]
+    fn a_repl_entry_with_nowhere_to_go_does_not_spin_for_ever() {
+        // The prompt echoes the entry before the job is sent, so a submit
+        // with no port selected has to close its own entry off.
+        let mut app = headless_app();
+        app.selected_port = None;
+        app.repl.input = "1 + 1".to_string();
+
+        app.submit_repl();
+
+        let entry = app.repl.entries.last().expect("the entry was echoed");
+        assert!(!entry.pending, "nothing will ever answer it");
+        assert!(!entry.stderr.is_empty(), "and it says why");
+    }
+
+    #[test]
+    fn the_ui_tracks_what_the_device_thread_is_doing() {
+        let mut app = headless_app();
+        assert!(app.busy.is_none());
+
+        app.apply_update(Update::Started("Syncing".to_string(), JobKind::Cancellable));
+        assert!(matches!(app.busy, Some((_, JobKind::Cancellable))));
+
+        app.apply_update(Update::Finished);
+        assert!(app.busy.is_none(), "the buttons come back when work ends");
+    }
+
+    #[test]
+    fn a_prompt_block_marks_continuation_lines() {
+        // A pasted block has to read as one submission, or the transcript
+        // looks like several separate commands.
+        assert_eq!(prompt_block("1 + 1"), ">>> 1 + 1");
+        assert_eq!(
+            prompt_block("for i in range(2):\n    print(i)"),
+            ">>> for i in range(2):\n...     print(i)"
+        );
+        assert_eq!(prompt_block(""), "");
+    }
+
+    #[test]
+    fn repl_history_walks_back_and_returns_to_a_blank_line() {
+        let mut repl = ReplPanel::default();
+        for entry in ["a = 1", "print(a)"] {
+            repl.input = entry.to_string();
+            repl.remember(entry);
+            repl.input.clear();
+        }
+
+        repl.recall_older();
+        assert_eq!(repl.input, "print(a)");
+        repl.recall_older();
+        assert_eq!(repl.input, "a = 1");
+        // Past the oldest entry, Up holds rather than wrapping around to the
+        // newest, which would silently re-run something else.
+        repl.recall_older();
+        assert_eq!(repl.input, "a = 1");
+
+        repl.recall_newer();
+        assert_eq!(repl.input, "print(a)");
+        // Down past the newest entry comes back to an empty prompt.
+        repl.recall_newer();
+        assert_eq!(repl.input, "");
+        repl.recall_newer();
+        assert_eq!(repl.input, "");
+    }
+
+    #[test]
+    fn repl_history_skips_an_immediate_repeat() {
+        let mut repl = ReplPanel::default();
+        repl.remember("print(1)");
+        repl.remember("print(1)");
+        repl.remember("print(2)");
+        repl.remember("print(1)");
+        assert_eq!(repl.history, vec!["print(1)", "print(2)", "print(1)"]);
+    }
+
+    #[test]
+    fn repl_scrollback_is_bounded() {
+        // A loop left printing must not grow the transcript without limit.
+        let mut repl = ReplPanel::default();
+        for i in 0..MAX_REPL_ENTRIES + 25 {
+            repl.push(ReplEntry {
+                source: Some(format!("print({i})")),
+                stdout: String::new(),
+                stderr: String::new(),
+                pending: false,
+            });
+        }
+        assert_eq!(repl.entries.len(), MAX_REPL_ENTRIES);
+        // The oldest go, not the newest.
+        assert_eq!(
+            repl.entries.last().and_then(|e| e.source.clone()),
+            Some(format!("print({})", MAX_REPL_ENTRIES + 24))
+        );
+        assert_eq!(
+            repl.entries.first().and_then(|e| e.source.clone()),
+            Some("print(25)".to_string())
+        );
     }
 
     #[test]

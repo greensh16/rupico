@@ -3,6 +3,58 @@
 Notable changes to rupico. Versions follow [semantic versioning](https://semver.org);
 while the major version is `0`, minor bumps may contain breaking changes.
 
+## 0.3.0
+
+The 0.3 milestone: the desktop app no longer freezes, and a cluster of
+correctness defects found by review are fixed.
+
+### Added
+
+- **A REPL in the desktop app.** The bottom dock is now tabbed — **Output** and
+  **REPL** — and the REPL runs what you type on the board over the connection
+  the rest of the app already holds, so the prompt, the Run button and the file
+  tree share the board's globals. Enter submits, Shift-Enter breaks the line,
+  Up and Down walk history, and ⌘L (Ctrl-L) jumps to the prompt from anywhere.
+  Entries are compiled in interactive mode, so an expression echoes its value
+  the way a prompt should: `machine.freq()` prints, `x = 9` does not. Firmware
+  without `compile` degrades to running the entry without the echo.
+- **`rupico rm --recursive`** removes a directory and everything inside it in
+  one round trip, and says what it removed. The GUI's delete dialog offers the
+  same as a checkbox. Plain `rm` on a directory now explains which flag it
+  needs instead of failing with a bare errno.
+- **The desktop app keeps drawing while the board is busy.** Serial I/O moved
+  to its own thread: the status bar shows what is running with a Cancel
+  button, the sync panel lists each decision as it is made, and a REPL entry
+  shows as pending until its result arrives. Cancel interrupts a running
+  program with Ctrl-C, or stops a sync at the next file boundary.
+- **`MicroPythonDevice::take_remote_warnings`**, for anything the board printed
+  to stderr without raising. The GUI shows these in the REPL transcript.
+
+### Fixed
+
+- **A device warning no longer fails the operation it interrupted.** Any
+  output on stderr was treated as a raised exception, so a board that logs
+  during `os.listdir` could not be listed at all. Only a traceback — or a
+  `SomeError:` line — counts as a failure now.
+- **rupico's helper programs no longer leave anything in your namespace.**
+  Every filesystem operation bound its temporaries (`p`, `f`, `src`, `b`) in
+  the same `__main__` your script and the REPL prompt then see, so a script
+  whose own first line was `src = open(...)` found someone else's `src`
+  already there. Helper programs now run inside a function.
+- **`ls -R` is one round trip instead of one per directory**, sharing the
+  walk sync has always used — without paying for sync's per-file hashing. The
+  GUI file tree uses it too, and no longer stops at four levels deep.
+- **Sync reads each local file once**, not once to hash and again to upload.
+
+### Changed
+
+- **`SyncOptions` gained `cancel`** (an `AtomicBool` a caller can set from
+  another thread) and **`SyncOutcome` gained `cancelled`**. A cancelled sync
+  returns a partial manifest, which must not be saved as a baseline.
+- **`list_tree(root, TreeOptions)`** joins `list_tree_hashed`, which stays as
+  it was. Hashes and mtimes are each opt-in, because both cost the board
+  something.
+
 ## 0.2.0
 
 The distribution release: rupico is on crates.io, and the desktop app is now a
